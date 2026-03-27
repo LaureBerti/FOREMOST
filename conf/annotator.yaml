@@ -1,0 +1,52 @@
+# satellite_annotator.py — Hydra configuration
+# Override from CLI: python satellite_annotator.py layers.roads.enabled=true
+# ──────────────────────────────────────────────────────────────────────────
+
+data:
+  image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
+  gpkg_path:  ""       # path to GeoPackage
+  layer:      ""       # GPKG layer name (empty = first layer)
+  N:          30             # grid size N×N
+
+layers:
+  elevation:
+    enabled:   false
+    path:      "./input/ELEVATION_acorda.tif"      # path to DEM GeoTIFF (empty = try SRTM via elevation pkg)
+    alpha:     .50
+    colormap:  "plasma"
+  roads:
+    enabled:   false
+    path:      "./input/ROADS_acorda.gpkg"      # path to shapefile/GPKG (empty = fetch from OSM)
+    alpha:     1
+    color:     "#e63946"
+    linewidth: 1.6
+  cadastral:
+    enabled:   false
+    path:      ./input/CADASTRE_acorda.gpkg"      # path to cadastral shapefile/GPKG
+    alpha:     1
+    color:     "#f4a261"
+    facecolor: "#f4a26118"
+    linewidth: 0.8
+  hydrology:
+    enabled:   false
+    path:      "./input/HYDRO_acorda.gpkg"      # path to shapefile/GPKG (empty = fetch waterways from OSM)
+    alpha:     1
+    color:     "#4cc9f0"
+    linewidth: 1.4
+
+cost:
+  default_cost: 500.0    # $ per cell applied to CLASS_RA cells with no cost
+  auto_fill:    False   # fill missing costs automatically on export
+
+ui:
+  canvas_size:        800
+  max_zoom:           16.0
+  pan_key_step:       40
+  auto_hab_threshold: 0.75
+  auto_label_threshold: 50
+  panel_width:        310
+
+output:
+  folder: "./output/"
+  prefix: "annotation"
+  dpi:    150
