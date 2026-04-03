@@ -1,0 +1,59 @@
+site_name: FOREMOST
+site_description: FOrest Restoration with Evolutionary Multiobjective Optimization STrategies
+site_author: Laure Berti-Equille
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: green
+      accent: light-green
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - scheme: slate
+      primary: green
+      accent: light-green
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - toc.integrate
+    - search.suggest
+    - content.code.copy
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: true
+            show_root_heading: true
+            heading_level: 2
+            docstring_style: numpy
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            merge_init_into_class: true
+
+nav:
+  - Home: index.md
+  - User Guide: usage.md
+  - API Reference:
+      - Overview: api/index.md
+      - Core (foremost.core): api/core.md
+      - Annotator (foremost.annotator): api/annotator.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true

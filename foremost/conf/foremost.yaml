@@ -1,0 +1,56 @@
+# foremost — Hydra configuration
+# Override any field via CLI:  python foremost.py optimizer.algo=CTAEA
+# ─────────────────────────────────────────────────────────────────────────
+
+data:
+  nrows:            30
+  ncols:            30
+  habitat_fraction: 0.28
+  cell_area:        1.0
+  seed:             7
+  image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
+  gpkg_path: "./input/land_use_classify.gpkg"
+  # Leave paths empty to use synthetic / computed data
+  habitat_path:     "./output/land_use_classify_annotated_N30_habitat_N30.npy"
+  restorable_path:  "./output/land_use_classify_annotated_N30_restorable_N30.npy"
+  accessible_path:  "./output/land_use_classify_annotated_N30_accessible_N30.npy"
+  cost_path:        "./output/land_use_classify_annotated_N30_cost_N30.npy"   # leave empty → uses compute_restoration_cost()
+  locked_out_path:  ""
+  elevation_path:   "./input/DEM_3857.tif"   # optional DEM raster
+
+cost:
+  tree_unit_cost:          30.0   # € per tree
+  tree_spacing_m:          2.0   # metres between trees
+  cell_size_m:             100.0      # cell side length in metres
+  inaccessible_surcharge:  0.4
+  elevation_base_m:        0.0
+  elevation_slope:         0.005  # extra cost / metre elevation
+  noise_sigma:             0.05
+
+constraints:
+  min_restore: 100.0
+  max_restore: 400.0
+  max_diameter: 10
+  max_nb_cc: 20
+  min_proportion: 0.1
+  max_cost: 20000
+
+optimizer:
+  # algo: GA | NSGA2 | NSGA3 | CTAEA | RNSGA3
+  algo:         NSGA2
+  # objective: MESH | IIC | COST | MESH_IIC | MESH_COST | IIC_COST | FULL
+  objective:    FULL
+  pop_size:     80
+  n_gen:        120
+  seed:         42
+  verbose:      true
+  iic_max_dist: 10
+  penalty:      1000000.0
+  pop_per_ref_point: 50
+  mu:      0.1
+
+output:
+  dir:    "outputs"
+  prefix: "foremost"
+  dpi:    150
+  show:   false

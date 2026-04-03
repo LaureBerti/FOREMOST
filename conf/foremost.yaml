@@ -3,20 +3,22 @@
 # ─────────────────────────────────────────────────────────────────────────
 
 data:
-  nrows:            20
-  ncols:            20
-  habitat_fraction: 0.2
-  restorable_fraction: 0.9
-  accessible_fraction: 1
+  mode:             2
+  nrows:            30
+  ncols:            30
+  habitat_fraction: 0.28
   cell_area:        1.0
   seed:             7
+  image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
+  gpkg_path: "./input/land_use_classify.gpkg"
   # Leave paths empty to use synthetic / computed data
-  habitat_path:     ""
-  restorable_path:  ""
-  accessible_path:  ""
-  cost_path:        ""   # leave empty → uses compute_restoration_cost()
+  npy_folder:       "./output/npy"
+  habitat_path:     "./output/land_use_classify_N30_habitat_N30.npy"
+  restorable_path:  "./output/land_use_classify_N30_restorable_N30.npy"
+  accessible_path:  "./output/land_use_classify_N30_accessible_N30.npy"
+  cost_path:        "./output/land_use_classify_N30_cost_N30.npy"   # leave empty → uses compute_restoration_cost()
   locked_out_path:  ""
-  elevation_path:   ""   # optional DEM raster
+  elevation_path:   "./input/DEM_3857.tif"   # optional DEM raster
 
 cost:
   tree_unit_cost:          30.0   # € per tree
@@ -28,29 +30,30 @@ cost:
   noise_sigma:             0.05
 
 constraints:
-  min_restore:    20.0
-  max_restore:    100.0
-  max_diameter:   9
-  max_nb_cc:      10
-  min_proportion: 0.0
-  max_cost:       20000
+  min_restore: 100.0
+  max_restore: 400.0
+  max_diameter: 10
+  max_nb_cc: 20
+  min_proportion: 0.1
+  max_cost: 20000
 
 optimizer:
   # algo: GA | NSGA2 | NSGA3 | CTAEA | RNSGA3
   algo:         NSGA2
   # objective: MESH | IIC | COST | MESH_IIC | MESH_COST | IIC_COST | FULL
   objective:    FULL
-  pop_size:     100
-  n_gen:        100
+  pop_size:     80
+  n_gen:        120
   seed:         42
   verbose:      true
   iic_max_dist: 10
-  penalty:      1e6
-  pop_per_ref_point:  50
-  mu: 0.1
+  penalty:      1000000.0
+  pop_per_ref_point: 50
+  mu:      0.1
 
 output:
   dir:    "outputs"
   prefix: "foremost"
+  prefix_syn: "foremost_synthetic"
   dpi:    150
   show:   false
