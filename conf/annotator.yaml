@@ -4,7 +4,7 @@
 
 data:
   image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
-  gpkg_path:  "./input/land_use_classify.gpkg"       # path to GeoPackage
+  gpkg_path:  "./input/PEC/PEC.gpkg"       # path to GeoPackage
   layer:      ""       # GPKG layer name (empty = first layer)
   N:          30             # grid size N×N
 
@@ -16,7 +16,7 @@ layers:
     colormap:  "plasma"
   roads:
     enabled:   false
-    path:      "./input/ROADS_acorda.gpkg" #   path to shapefile/GPKG (empty = fetch from OSM)
+    path:      "./input/PEC/ROADS.gpkg" #   path to shapefile/GPKG (empty = fetch from OSM)
     alpha:     0.65
     color:     "#e63946"
     linewidth: 1.6

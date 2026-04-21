@@ -10,6 +10,7 @@ data:
   seed:             7
   image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
   gpkg_path: "./input/land_use_classify.gpkg"
+  npy-folder: "/ouputs"
   # Leave paths empty to use synthetic / computed data
   habitat_path:     "./output/land_use_classify_annotated_N30_habitat_N30.npy"
   restorable_path:  "./output/land_use_classify_annotated_N30_restorable_N30.npy"

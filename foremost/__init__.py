@@ -21,7 +21,7 @@ from foremost.core import (
 from foremost.core import HabitatData
 
 # --- Ecological cost function ------------------------------------------------
-from foremost.core import compute_restoration_cost
+from foremost.core import compute_restoration_cost, compute_slope
 
 # --- Landscape indices -------------------------------------------------------
 from foremost.core import mesh, iic, compute_patches
@@ -38,7 +38,7 @@ from foremost.core import (
 from foremost.core import ForemostProblemBuilder
 
 # --- Entry points ------------------------------------------------------------
-from foremost.core import run_demo, load_npy_arrays
+from foremost.core import run_demo, load_npy_arrays, load_habitatdata_from_npy
 
 # --- Annotator (optional — requires tkinter) ---------------------------------
 try:
@@ -67,6 +67,7 @@ __all__ = [
     "HabitatData",
     # cost
     "compute_restoration_cost",
+    "compute_slope",
     # indices
     "mesh",
     "iic",
@@ -80,6 +81,7 @@ __all__ = [
     "ForemostProblemBuilder",
     "run_demo",
     "load_npy_arrays",
+    "load_habitatdata_from_npy",
     # annotator (conditional)
     "AnnotatorConfig",
     "annotate",

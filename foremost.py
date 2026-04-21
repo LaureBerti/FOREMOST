@@ -83,7 +83,8 @@ Dependencies
     pip install pymoo numpy scipy rasterio matplotlib networkx
     pip install hydra-core omegaconf        # optional but recommended
 """
-
+import shapely
+from annotation import annotate, CRS_WEB_MERCATOR, AnnotatorConfig
 import os
 import sys
 import textwrap
@@ -172,6 +173,7 @@ SUPPORTED_ALGOS = ("GA", "NSGA2", "NSGA3", "CTAEA", "RNSGA3")
 class DataConfig:
     """Paths and parameters for input rasters."""
 
+    mode: int = 2
     nrows: int = 30
     ncols: int = 30
     habitat_fraction: float = 0.28
@@ -213,6 +215,20 @@ class ConstraintsConfig:
     max_cost: float = float("inf")
     min_app_compliance: float = 0.0   # fraction of restored cells in APPs (Forest Code Art. 61-A)
     max_slope_deg: float = float("inf")  # max terrain slope for restoration (degrees)
+    # NC1: minimum cells per connected component (0 = disabled)
+    min_patch_size: int = 0
+    # NC2: maximum edge-to-area ratio of restored zone (1.0 = disabled)
+    max_edge_ratio: float = 1.0
+    # NC3: minimum IIC delta above pre-restoration baseline (0.0 = disabled)
+    min_iic_delta: float = 0.0
+    # NC4: maximum Chebyshev distance from restored cell to existing habitat (0 = disabled)
+    max_distance_to_habitat: int = 0
+    # NC7: minimum total carbon stock delivered in tCO2 (0.0 = disabled)
+    min_carbon_stock: float = 0.0
+    carbon_rate_tco2_ha_yr: float = 3.0   # Atlantic Forest average (Chazdon et al. 2016)
+    carbon_horizon_yr: int = 20
+    # NC8: minimum corridor width in cells via morphological erosion (0 = disabled)
+    min_corridor_width: int = 0
 
 
 @dataclass
@@ -312,10 +328,11 @@ def write_default_yaml(config_dir: Union[str, Path] = "conf") -> Path:
       mu:      {cfg.optimizer.mu}
  
     output:
-      dir:    "{cfg.output.dir}"
-      prefix: "{cfg.output.prefix}"
-      dpi:    {cfg.output.dpi}
-      show:   {str(cfg.output.show).lower()}
+      dir:       "{cfg.output.dir}"
+      prefix:    "{cfg.output.prefix}"
+      dpi:       {cfg.output.dpi}
+      show:      {str(cfg.output.show).lower()}
+      fig_saved: false
     """
     )
     config_dir = Path(config_dir)
@@ -355,7 +372,13 @@ def _cfg_to_dataclass(cfg) -> ForemostConfig:
         try:
             return cls(**kw)
         except TypeError:
-            return cls()
+            # Filter to known fields — handles unknown CLI overrides gracefully
+            known = set(vars(cls()).keys())
+            filtered = {k: v for k, v in kw.items() if k in known}
+            try:
+                return cls(**filtered)
+            except TypeError:
+                return cls()
 
     return ForemostConfig(
         data=_sub(cfg, "data", DataConfig),
@@ -1039,12 +1062,20 @@ class RestorationConstraints:
 
     min_restore: float = 2.0
     max_restore: float = float("inf")
-    max_diameter: int = 9999
-    max_nb_cc: int = 9999
+    max_diameter: int = 10
+    max_nb_cc: int = 1
     min_proportion: float = 0.0
     max_cost: float = float("inf")
-    min_app_compliance: float = 0.0   # fraction of restored cells in APPs (Forest Code Art. 61-A)
-    max_slope_deg: float = float("inf")  # max terrain slope for restoration (degrees)
+    min_app_compliance: float = 0.0
+    max_slope_deg: float = float("inf")
+    min_patch_size: int = 0
+    max_edge_ratio: float = 1.0
+    min_iic_delta: float = 0.0
+    max_distance_to_habitat: int = 0
+    min_carbon_stock: float = 0.0
+    carbon_rate_tco2_ha_yr: float = 3.0
+    carbon_horizon_yr: int = 20
+    min_corridor_width: int = 0
 
     @classmethod
     def from_config(cls, cfg: ConstraintsConfig) -> "RestorationConstraints":
@@ -1107,6 +1138,36 @@ class RestorationProblem(ElementwiseProblem):
         self.total_area_cells = int((data.habitat != data.nodata_value).sum())
         cand_costs = data.cost[cr, cc]
         self._cost_scale = float(cand_costs.sum()) or 1.0
+
+        # ---- NC3: precompute baseline IIC --------------------------------
+        if constraints.min_iic_delta > 0.0:
+            self._baseline_iic = iic(
+                data.habitat,
+                total_cells=self.total_area_cells,
+                cell_area=data.cell_area,
+                max_dist=iic_max_dist,
+            )
+        else:
+            self._baseline_iic = 0.0
+
+        # ---- NC4: precompute per-candidate Chebyshev distance to habitat -
+        if constraints.max_distance_to_habitat > 0:
+            hab_rows, hab_cols = np.where(data.habitat == 1)
+            if len(hab_rows) == 0:
+                self._cand_dist_to_hab = np.full(self.n_candidates, np.inf)
+            else:
+                dr = np.abs(cr[:, None] - hab_rows[None, :])
+                dc = np.abs(cc[:, None] - hab_cols[None, :])
+                self._cand_dist_to_hab = np.maximum(dr, dc).min(axis=1)
+        else:
+            self._cand_dist_to_hab = None
+
+        # ---- NC5: precompute per-candidate slope mask --------------------
+        if np.isfinite(constraints.max_slope_deg) and data.elevation is not None:
+            slope_grid = compute_slope(data.elevation, cell_size_m=100.0)
+            self._cand_slope = slope_grid[cr, cc]
+        else:
+            self._cand_slope = None
 
         super().__init__(
             n_var=self.n_candidates,
@@ -1175,8 +1236,6 @@ class RestorationProblem(ElementwiseProblem):
                 v += (c.min_proportion - prop) ** 2
 
         # ---- 5. APP compliance (Brazilian Forest Code Art. 61-A) -----
-        # Requires a minimum fraction of restored cells to fall in APPs
-        # (riparian buffers, hilltops, steep slopes).
         if c.min_app_compliance > 0.0 and self.habitat_data.app_mask is not None:
             if sel.any():
                 app_vals = self.habitat_data.app_mask[
@@ -1186,18 +1245,78 @@ class RestorationProblem(ElementwiseProblem):
                 if app_fraction < c.min_app_compliance:
                     v += (c.min_app_compliance - app_fraction) ** 2
 
-        # ---- 6. Slope constraint -------------------------------------
-        # Excludes cells on terrain steeper than max_slope_deg.
-        # Uses the elevation layer; inactive when elevation is absent.
-        if np.isfinite(c.max_slope_deg) and self.habitat_data.elevation is not None:
-            slope = compute_slope(self.habitat_data.elevation, cell_size_m=100.0)
-            if sel.any():
-                sel_slopes = slope[
-                    self._candidate_rows[sel], self._candidate_cols[sel]
-                ]
-                excess = np.maximum(0.0, sel_slopes - c.max_slope_deg)
-                if excess.any():
-                    v += float((excess ** 2).sum())
+        # ---- 6. Slope (NC5) — uses precomputed per-candidate slope ----
+        if self._cand_slope is not None and sel.any():
+            excess = np.maximum(0.0, self._cand_slope[sel] - c.max_slope_deg)
+            if excess.any():
+                v += float((excess ** 2).sum())
+
+        # ---- NC1: Minimum viable patch size ---------------------------
+        if c.min_patch_size > 0 and sel.any():
+            sg = self._build_selection_grid(x)
+            labeled_sel, n_sel = ndimage_label(sg == 1, structure=_CONN8)
+            for lbl in range(1, n_sel + 1):
+                cc_size = int((labeled_sel == lbl).sum())
+                if cc_size < c.min_patch_size:
+                    v += (c.min_patch_size - cc_size) ** 2
+
+        # ---- NC2: Maximum edge-to-area ratio --------------------------
+        if c.max_edge_ratio < 0.999 and sel.any():
+            sg = self._build_selection_grid(x)
+            n_selected = int(sel.sum())
+            if n_selected > 0:
+                from scipy.ndimage import binary_erosion as _bin_erosion
+                interior = _bin_erosion(
+                    sg == 1, structure=np.ones((3, 3), dtype=int), border_value=0
+                )
+                n_edge = n_selected - int(interior.sum())
+                ratio = n_edge / n_selected
+                if ratio > c.max_edge_ratio:
+                    v += (ratio - c.max_edge_ratio) ** 2 * n_selected
+
+        # ---- NC3: Minimum IIC delta -----------------------------------
+        if c.min_iic_delta > 0.0 and sel.any():
+            hg = self._build_habitat_grid(x)
+            current_iic = iic(
+                hg,
+                total_cells=self.total_area_cells,
+                cell_area=self.habitat_data.cell_area,
+                max_dist=self.iic_max_dist,
+            )
+            delta = current_iic - self._baseline_iic
+            if delta < c.min_iic_delta:
+                v += (c.min_iic_delta - delta) ** 2 * 1e4
+
+        # ---- NC4: Maximum distance to existing habitat ----------------
+        if self._cand_dist_to_hab is not None and sel.any():
+            excess_dist = self._cand_dist_to_hab[sel] - c.max_distance_to_habitat
+            excess_dist = excess_dist[excess_dist > 0]
+            if len(excess_dist) > 0:
+                v += float((excess_dist ** 2).sum())
+
+        # ---- NC7: Minimum carbon stock --------------------------------
+        if c.min_carbon_stock > 0.0 and sel.any():
+            n_selected = int(sel.sum())
+            # Assume 100 m × 100 m cells → 1 ha per cell
+            total_area_ha = float(n_selected)
+            carbon_total = total_area_ha * c.carbon_rate_tco2_ha_yr * c.carbon_horizon_yr
+            if carbon_total < c.min_carbon_stock:
+                v += ((c.min_carbon_stock - carbon_total) / max(c.min_carbon_stock, 1.0)) ** 2
+
+        # ---- NC8: Minimum corridor width (morphological erosion) ------
+        if c.min_corridor_width > 0 and sel.any():
+            from scipy.ndimage import binary_erosion as _bin_erosion2
+            sg = self._build_selection_grid(x)
+            eroded = sg.astype(bool)
+            _, n_initial = ndimage_label(eroded, structure=_CONN8)
+            if n_initial > 0:
+                struct3 = np.ones((3, 3), dtype=int)
+                for step in range(1, c.min_corridor_width + 1):
+                    eroded = _bin_erosion2(eroded, structure=struct3, border_value=0)
+                    _, n_eroded = ndimage_label(eroded, structure=_CONN8)
+                    if n_eroded != n_initial or not eroded.any():
+                        v += (c.min_corridor_width - step + 1) ** 2
+                        break
 
         return v
 
@@ -1354,10 +1473,10 @@ def _build_algorithm(
             return NSGA2(**common)
         n_part = max(4, pop_size // (n_obj * 3))
         ref_dirs = get_reference_directions("das-dennis", n_obj, n_partitions=n_part)
-        # CTAEA needs ref_dirs; does NOT accept eliminate_duplicates or pop_size
-        common_ctaea = {k: v for k, v in common.items()
+        # CTAEA sets pop_size from ref_dirs — pass only operators, not pop_size
+        ctaea_kwargs = {k: v for k, v in common.items()
                         if k in ("sampling", "crossover", "mutation")}
-        return CTAEA(ref_dirs=ref_dirs, **common_ctaea)
+        return CTAEA(ref_dirs=ref_dirs, **ctaea_kwargs)
 
     if name == "RNSGA3":
         if not _HAS_RNSGA3:
@@ -1380,10 +1499,10 @@ def _build_algorithm(
         ppr = _n * (_n + 1) // 2
         if ppr < target_ppr:
             ppr = (_n + 1) * (_n + 2) // 2
-        common_rnsga3 = {k: v for k, v in common.items()
+        rnsga3_kwargs = {k: v for k, v in common.items()
                          if k in ("sampling", "crossover", "mutation")}
-        return RNSGA3(ref_points=ref_points, mu=0.1, pop_per_ref_point=ppr,
-                      **common_rnsga3)
+        return RNSGA3(ref_points=ref_points, pop_per_ref_point=ppr, mu=0.1,
+                      **rnsga3_kwargs)
 
     raise ValueError(
         f"Unknown algorithm '{algo_name}'. " f"Choose from: {SUPPORTED_ALGOS}"
@@ -1459,7 +1578,7 @@ def solve(
         termination,
         seed=seed,
         verbose=False,
-        callback=ProgressCallback(every=max(1, n_gen // 10)) if verbose else Callback(),
+        **({} if not verbose else {"callback": ProgressCallback(every=max(1, n_gen // 10))}),
     )
 
     # ── population-level feasibility (empirical, not tautological) ───────────
@@ -1622,8 +1741,9 @@ def plot_solution(
     algo_name: Optional[str] = None,
     figsize: tuple = (16, 9),
     save_path: Optional[str] = None,
+    fig_saved: bool = False,
     bg_alpha: float = 0.30,
-    show: bool = True,
+    show: bool = False,
 ):
     """
     Rich 2×3 layout with optional satellite background in transparency.
@@ -1801,7 +1921,8 @@ def plot_solution(
     ax.set_facecolor("#f8f9fa")
 
     # plt.tight_layout(rect=[0, 0, 1, 0.97])
-    if save_path:
+    if fig_saved and save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, bbox_inches="tight", dpi=150)
         print(f"  Saved → {save_path}")
     if show:
@@ -1818,8 +1939,9 @@ def plot_pareto_front(
     objective: ObjectiveType,
     algo_name: Optional[str] = None,
     save_path: Optional[str] = None,
+    fig_saved: bool = False,
     figsize: tuple = (9, 6),
-    show: bool = True,
+    show: bool = False,
 ):
     """Scatter plot of a 2-objective Pareto front, coloured by total cost."""
     if not objective.is_multi or objective.n_obj != 2:
@@ -1892,7 +2014,8 @@ def plot_pareto_front(
         )
 
     plt.tight_layout()
-    if save_path:
+    if fig_saved and save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, bbox_inches="tight", dpi=150)
         print(f"  Saved → {save_path}")
     if show:
@@ -1908,8 +2031,9 @@ def plot_pareto_front_3d(
     solutions: List[dict],
     algo_name: Optional[str] = None,
     save_path: Optional[str] = None,
+    fig_saved: bool = False,
     figsize: tuple = (10, 7),
-    show: bool = True,
+    show: bool = False,
 ):
     """3-D scatter for the FULL (MESH x IIC x cost) Pareto front."""
     mesh_v = [s["mesh"] for s in solutions]
@@ -1942,7 +2066,8 @@ def plot_pareto_front_3d(
     )
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    if save_path:
+    if fig_saved and save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, bbox_inches="tight", dpi=150)
         print(f"  Saved → {save_path}")
     if show:
@@ -1960,9 +2085,10 @@ def plot_solutions_comparison(
     labels: List[str],
     algo_names: Optional[List[str]] = None,
     save_path: Optional[str] = None,
+    fig_saved: bool = False,
     figsize: Optional[tuple] = None,
     bg_alpha: float = 0.30,
-    show: bool = True,
+    show: bool = False,
 ):
     """
     Side-by-side selection maps + metric bar charts for N solutions.
@@ -2051,7 +2177,8 @@ def plot_solutions_comparison(
             ab.set_title("Metrics (normalised)", fontsize=9)
 
     plt.tight_layout()
-    if save_path:
+    if fig_saved and save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, bbox_inches="tight", dpi=150)
         print(f"  Saved → {save_path}")
     if show:
@@ -2067,8 +2194,9 @@ def plot_cost_surface(
     data: HabitatData,
     algo_name: Optional[str] = None,
     save_path: Optional[str] = None,
+    fig_saved: bool = False,
     figsize: tuple = (14, 5),
-    show: bool = True,
+    show: bool = False,
 ):
     """
     3-panel figure illustrating the ecological cost function inputs and output.
@@ -2131,7 +2259,8 @@ def plot_cost_surface(
     ax.axis("off")
 
     plt.tight_layout()
-    if save_path:
+    if fig_saved and save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, bbox_inches="tight", dpi=150)
         print(f"  Saved → {save_path}")
     if show:
@@ -2207,7 +2336,7 @@ class ForemostProblemBuilder:
         max_diameter: float = 10.0,
         max_nb_cc: int = 10,
         min_proportion: float = 0.0,
-        max_cost: float = float("inf"),
+        max_cost: float = 20000,
     ) -> "ForemostProblemBuilder":
 
         self._constraints.min_restore = min_restore
@@ -2386,9 +2515,9 @@ def load_habitatdata_from_npy(npy_dir: str = "outputs/", cell_area: float = 1.0)
     """
     Load a HabitatData from .npy array files exported by satellite_annotator.py.
 
-    This is the mode=1 equivalent for use inside Python scripts.  All experiment
-    scripts should call this instead of HabitatData.from_config() with a synthetic
-    DataConfig, so that results are based on real annotated landscape data.
+    This is the mode=1 equivalent for use inside Python scripts that need to build
+    a HabitatData without calling run_demo().  All experiment scripts should use
+    this function instead of HabitatData.from_config() with synthetic DataConfig.
 
     Parameters
     ----------
@@ -2457,6 +2586,7 @@ def _run_all_objectives(
         data,
         algo_name=cfg.optimizer.algo,
         save_path=f"{out_dir}/{pfx}_{algo}_0_cost_surface.png",
+        fig_saved=cfg.output.fig_saved,
         show=cfg.output.show,
     )
 
@@ -2477,6 +2607,7 @@ def _run_all_objectives(
         title=f"Single-objective — Max MESH  {label}",
         algo_name=r_mesh["algo_name"],
         save_path=f"{out_dir}/{pfx}_1_mesh.png",
+        fig_saved=cfg.output.fig_saved,
         show=show,
     )
 
@@ -2489,6 +2620,7 @@ def _run_all_objectives(
         title=f"Single-objective — Max IIC  {label}",
         algo_name=r_iic["algo_name"],
         save_path=f"{out_dir}/{pfx}_2_iic.png",
+        fig_saved=cfg.output.fig_saved,
         show=show,
     )
 
@@ -2516,6 +2648,7 @@ def _run_all_objectives(
         title=f"Single-objective — Min Cost  {label}",
         algo_name=r_cost["algo_name"],
         save_path=f"{out_dir}/{pfx}_3_cost.png",
+        fig_saved=cfg.output.fig_saved,
         show=show,
     )
 
@@ -2549,6 +2682,7 @@ def _run_all_objectives(
         ["Max MESH", "Max IIC", "Min Cost"],
         algo_names=[r_mesh["algo_name"], r_iic["algo_name"], r_cost["algo_name"]],
         save_path=f"{out_dir}/{pfx}_{algo}_4_comparison.png",
+        fig_saved=cfg.output.fig_saved,
         show=show,
     )
 
@@ -2560,6 +2694,7 @@ def _run_all_objectives(
         ObjectiveType.MESH_COST,
         algo_name=r_mc["algo_name"],
         save_path=f"{out_dir}/{pfx}_5_pareto_mesh_cost.png",
+        fig_saved=cfg.output.fig_saved,
         show=show,
     )
 
@@ -2571,6 +2706,7 @@ def _run_all_objectives(
         ObjectiveType.IIC_COST,
         algo_name=r_ic["algo_name"],
         save_path=f"{out_dir}/{pfx}_6_pareto_iic_cost.png",
+        fig_saved=cfg.output.fig_saved,
         show=show,
     )
 
@@ -2581,10 +2717,12 @@ def _run_all_objectives(
         r_full["solutions"],
         algo_name=r_full["algo_name"],
         save_path=f"{out_dir}/{pfx}_7_pareto_3d.png",
+        fig_saved=cfg.output.fig_saved,
         show=show,
     )
 
     # ── Export FULL Pareto front to CSV for downstream analysis ───────────────
+    # Columns: cost, mesh, iic, n_cells, total_area  (+ HV in header comment)
     _save_pareto_csv(r_full["solutions"], f"{out_dir}/{pfx}_pareto.csv",
                      hypervolume=r_full.get("hypervolume", float("nan")),
                      algo=r_full["algo_name"])
@@ -2617,7 +2755,9 @@ def _run_mode0(cfg: "ForemostConfig") -> tuple:
     print("  FOREMOST  —  MODE 0: Synthetic landscape")
     print(
         f"  Grid : {cfg.data.nrows}×{cfg.data.ncols}  "
-        f"seed={cfg.data.seed_gen}  algo={cfg.optimizer.algo}"
+        f"Data generation seed={cfg.data.seed_gen}  "
+        f"Optimization algorithm={cfg.optimizer.algo}"
+        f" Size N={cfg.data.ncols}"
     )
     print("=" * 65)
 
@@ -2636,10 +2776,6 @@ def _run_mode0(cfg: "ForemostConfig") -> tuple:
     out_dir = cfg.output.dir
     os.makedirs(out_dir, exist_ok=True)
     pfx = cfg.output.prefix
-
-    # plot_cost_surface(data, algo_name=cfg.optimizer.algo,
-    #                   save_path=f"{out_dir}/{pfx}_0_cost_surface.png",
-    #                   show=cfg.output.show)
 
     results = _run_all_objectives(data, cfg, out_dir, pfx, label="mode=0")
     print(f"\n  Mode 0 complete — outputs saved to {out_dir}/")
@@ -2733,19 +2869,12 @@ def _run_mode1(cfg: "ForemostConfig") -> tuple:
     os.makedirs(out_dir, exist_ok=True)
     pfx = cfg.output.prefix
 
-    plot_cost_surface(
-        data,
-        algo_name=cfg.optimizer.algo,
-        save_path=f"{out_dir}/{pfx}_0_cost_surface.png",
-        show=cfg.output.show,
-    )
-
     results = _run_all_objectives(data, cfg, out_dir, pfx, label="mode=1")
     print(f"\n  Mode 1 complete — outputs saved to {out_dir}/")
     return results
 
 
-# ── MODE 2: launch nnotator GUI, then optimise ─────────────────────
+# ── MODE 2: launch annotator GUI, then optimise ─────────────────────
 
 
 def _run_mode2(cfg: "ForemostConfig") -> tuple:
@@ -2831,19 +2960,20 @@ def _run_mode2(cfg: "ForemostConfig") -> tuple:
     # ── 3. Launch GUI ─────────────────────────────────────────────────────────
     if gpkg_path:
         print(f"\n  Annotating GPKG: {Path(gpkg_path).name}  (N={N}×{N}) …")
-        result = sa.annotate_gpkg(gpkg_path=gpkg_path, N=N, ask_N=False)
+        arrays = sa.annotate_gpkg(gpkg_path=gpkg_path, N=N, ask_N=False)
         # annotate_gpkg returns a GeoDataFrame; extract the arrays from the app
         # by calling annotate-style instead
-        if result is None:
+        if arrays is None:
             raise RuntimeError("Annotator GUI closed without exporting arrays.")
+
         # Build arrays dict from GeoDataFrame columns
         import numpy as _np
 
         N2 = N * N
 
         def _col(col, default):
-            if hasattr(result, "columns") and col in result.columns:
-                return _np.asarray(result[col].values[:N2], dtype=float)
+            if hasattr(arrays, "columns") and col in arrays.columns:
+                return _np.asarray(arrays[col].values[:N2], dtype=float)
             return _np.full(N2, default, dtype=float)
 
         arrays = {
@@ -2858,61 +2988,37 @@ def _run_mode2(cfg: "ForemostConfig") -> tuple:
         if not arrays:
             raise RuntimeError("Annotator GUI closed without exporting arrays.")
 
-    # ── 4. Summary ────────────────────────────────────────────────────────────
-    print("\n  Arrays received from Annotator:")
-    for k, v in arrays.items():
-        arr = np.asarray(v)
-        print(
-            f"    {k:>12s} : shape={arr.shape}  "
-            f"min={float(arr.min()):.3g}  max={float(arr.max()):.3g}"
-        )
-
-    data = _arrays_to_habitatdata(
-        {k: np.asarray(v) for k, v in arrays.items()},
-        cell_area=cfg.data.cell_area,
-    )
-
-    # Attach optional elevation array produced by annotator
-    elev = arrays.get("elevation")
-    if elev is not None:
-        elev_arr = np.asarray(elev, dtype=np.float64)
-        if elev_arr.shape == data.shape:
-            data.elevation = elev_arr
-            print(
-                f"  Elevation array attached  shape={elev_arr.shape}  "
-                f"range=[{elev_arr.min():.3f}, {elev_arr.max():.3f}]"
-            )
-
-    cands = data.candidate_mask
-    print(f"\n  Habitat cells   : {data.habitat_mask.sum()}")
-    print(f"  Candidate cells : {cands.sum()}")
-    if cands.any():
-        print(
-            f"  Cost range (€)  : "
-            f"{data.cost[cands].min():.1f} – {data.cost[cands].max():.1f}"
-        )
-
+    # ── 4. Persist arrays to disk ─────────────────────────────────────────────
     out_dir = cfg.output.dir
     os.makedirs(out_dir, exist_ok=True)
     pfx = cfg.output.prefix
+    N_str = f"N{N}"
 
-    plot_cost_surface(
-        data,
-        algo_name=cfg.optimizer.algo,
-        save_path=f"{out_dir}/{pfx}_0_cost_surface.png",
-        show=cfg.output.show,
-    )
+    # print("\n  Saving arrays from Annotator:")
+    # for key in ("habitat", "restorable", "accessible", "cost"):
+    #     arr = np.asarray(arrays[key])
+    #     path = os.path.join(out_dir, f"{pfx}_{key}_{N_str}.npy")
+    #     np.save(path, arr)
+    #     print(f"  Saved  {key:>12s}  →  {path}")
+    #
+    # elev = arrays.get("elevation")
+    # if elev is not None:
+    #     arr = np.asarray(elev, dtype=np.float64)
+    #     path = os.path.join(out_dir, f"{pfx}_elevation_{N_str}.npy")
+    #     np.save(path, arr)
+    #     print(f"  Saved  {'elevation':>12s}  →  {path}")
 
-    results = _run_all_objectives(data, cfg, out_dir, pfx, label="mode=2")
-    print(f"\n  Mode 2 complete — outputs saved to {out_dir}/")
-    return results
+    # ── 5. Delegate to mode 1 ─────────────────────────────────────────────────
+    print(f"\n  Delegating to mode 1 — loading from: {out_dir}")
+    cfg.data.npy_folder = out_dir
+    return _run_mode1(cfg)
 
 
 # ── public dispatcher ─────────────────────────────────────────────────────────
 
 
 def run_demo(
-    mode: int = 0,
+    mode: int = 2,
     cfg: Optional["ForemostConfig"] = None,
 ) -> tuple:
     """
@@ -2947,7 +3053,7 @@ def run_demo(
     """
     if cfg is None:
         cfg = ForemostConfig()
-    cfg.mode = mode  # keep cfg consistent
+    cfg.data.mode = mode  # keep cfg consistent with the argument
 
     if mode == 0:
         return _run_mode0(cfg)
@@ -2960,6 +3066,71 @@ def run_demo(
             f"Unknown mode={mode}.  Use 0 (synthetic), 1 (npy folder), "
             "2 (Annotator GUI)."
         )
+
+
+# ── Mode picker GUI ───────────────────────────────────────────────────────────
+
+
+def _pick_mode_gui() -> int:
+    """Show a small tkinter dialog to pick the run mode. Returns 0, 1, or 2."""
+    import tkinter as tk
+
+    chosen = [2]  # mutable container so _ok can write to it
+
+    root = tk.Tk()
+    root.title("FOREMOST — Select Mode")
+    root.resizable(False, False)
+
+    tk.Label(
+        root, text="Select run mode:", font=("Helvetica", 12, "bold"), pady=10
+    ).pack()
+
+    _MODES = [
+        (
+            0,
+            "Mode 0 — Synthetic landscape",
+            "Generate a landscape from YAML / default config (no files needed)",
+        ),
+        (
+            1,
+            "Mode 1 — Load .npy arrays",
+            "Load pre-exported NumPy arrays from a folder on disk",
+        ),
+        (
+            2,
+            "Mode 2 — Annotator GUI",
+            "Launch the interactive annotation tool on a raster or GPKG file",
+        ),
+    ]
+
+    var = tk.IntVar(value=2)
+    for val, label, desc in _MODES:
+        frame = tk.Frame(root)
+        frame.pack(anchor="w", padx=20, pady=4)
+        tk.Radiobutton(
+            frame, text=label, variable=var, value=val, font=("Helvetica", 10)
+        ).pack(anchor="w")
+        tk.Label(frame, text=desc, fg="gray", font=("Helvetica", 9), padx=24).pack(
+            anchor="w"
+        )
+
+    def _ok():
+        chosen[0] = var.get()
+        root.destroy()
+
+    tk.Button(
+        root,
+        text="Run",
+        command=_ok,
+        width=12,
+        bg="#2e7d32",
+        fg="black",
+        font=("Helvetica", 10),
+    ).pack(pady=12)
+
+    root.mainloop()
+
+    return chosen[0]
 
 
 # ── Hydra entry point ─────────────────────────────────────────────────────────
@@ -3010,7 +3181,12 @@ def main():
         "--write-config", action="store_true", help="Write conf/foremost.yaml and exit"
     )
     parser.add_argument(
-        "--mode", "-m", type=int, default=0, choices=[0, 1, 2], help="Run mode (0/1/2)"
+        "--mode",
+        "-m",
+        type=int,
+        default=None,
+        choices=[0, 1, 2],
+        help="Run mode (0/1/2); omit to show a GUI picker",
     )
     parser.add_argument(
         "--npy-folder",
@@ -3065,8 +3241,10 @@ def main():
     if args.gpkg:
         cfg.data.gpkg_path = args.gpkg
 
-    run_demo(mode=args.mode, cfg=cfg)
+    # mode = args.mode if args.mode is not None else
+    mode = 2
+    cfg.data.mode = mode
 
 
 if __name__ == "__main__":
-    run_demo(2)
+    main()

@@ -2,23 +2,27 @@
 # Override any field via CLI:  python foremost.py optimizer.algo=CTAEA
 # ─────────────────────────────────────────────────────────────────────────
 
+# Run mode: 0=synthetic, 1=load .npy arrays (default), 2=annotator GUI
+mode: 1
+
 data:
-  mode:             2
+  mode:             1         # 0=synthetic | 1=npy folder | 2=annotator GUI
+  seed_gen:         7
   nrows:            30
   ncols:            30
   habitat_fraction: 0.28
   cell_area:        1.0
-  seed:             7
-  image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
-  gpkg_path: "./input/land_use_classify.gpkg"
-  # Leave paths empty to use synthetic / computed data
-  npy_folder:       "./output/npy"
-  habitat_path:     "./output/land_use_classify_N30_habitat_N30.npy"
-  restorable_path:  "./output/land_use_classify_N30_restorable_N30.npy"
-  accessible_path:  "./output/land_use_classify_N30_accessible_N30.npy"
-  cost_path:        "./output/land_use_classify_N30_cost_N30.npy"   # leave empty → uses compute_restoration_cost()
+  image_path:       ""
+  gpkg_path:        ""
+  # mode=1: folder containing land_use_classify_{habitat,restorable,accessible,cost}_N*.npy
+  npy_folder:       "outputs/"
+  # mode=0 raster paths (leave empty to use synthetic data)
+  habitat_path:     ""
+  restorable_path:  ""
+  accessible_path:  ""
+  cost_path:        ""
   locked_out_path:  ""
-  elevation_path:   "./input/DEM_3857.tif"   # optional DEM raster
+  elevation_path:   ""
 
 cost:
   tree_unit_cost:          30.0   # € per tree
@@ -30,12 +34,23 @@ cost:
   noise_sigma:             0.05
 
 constraints:
-  min_restore: 100.0
-  max_restore: 400.0
-  max_diameter: 10
-  max_nb_cc: 20
-  min_proportion: 0.1
-  max_cost: 20000
+  # PEC 30×30 grid has 83 candidate cells (restorable & accessible); min_restore must be < 83
+  min_restore: 10.0    # minimum cells to restore (ha at 1 ha/cell)
+  max_restore: 200.0   # generous upper bound — bounded by n_candidates at runtime
+  max_diameter: 10     # compactness: max corridor width = 10 cells = 1 km
+  max_nb_cc: 20        # max connected components (corridors)
+  min_proportion: 0.0
+  max_cost: 20000      # EUR budget cap
+  min_app_compliance: 0.0   # NC6: fraction of restored cells in APPs (0.0=disabled)
+  max_slope_deg: .inf       # NC5: max terrain slope in degrees (.inf=disabled)
+  min_patch_size: 0         # NC1: min cells per connected component (0=disabled)
+  max_edge_ratio: 1.0       # NC2: max edge-to-area ratio (1.0=disabled)
+  min_iic_delta: 0.0        # NC3: min IIC improvement above baseline (0.0=disabled)
+  max_distance_to_habitat: 0  # NC4: max Chebyshev distance to habitat (0=disabled)
+  min_carbon_stock: 0.0     # NC7: min tCO2 over horizon (0.0=disabled)
+  carbon_rate_tco2_ha_yr: 3.0  # NC7: tCO2/ha/yr (Atlantic Forest default)
+  carbon_horizon_yr: 20     # NC7: accounting horizon (years)
+  min_corridor_width: 0     # NC8: min corridor width in cells (0=disabled)
 
 optimizer:
   # algo: GA | NSGA2 | NSGA3 | CTAEA | RNSGA3
@@ -54,6 +69,6 @@ optimizer:
 output:
   dir:    "outputs"
   prefix: "foremost"
-  prefix_syn: "foremost_synthetic"
   dpi:    150
   show:   false
+  fig_saved: true

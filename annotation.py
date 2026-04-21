@@ -83,6 +83,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     import geopandas as gpd
+
 from shapely.geometry import Polygon, mapping
 
 import numpy as np
@@ -3974,7 +3975,7 @@ def main():
                     print(f"  {col:14s}: {gdf[col].dtype}")
     else:
         arrays = annotate(image_path=args.image or None,
-                                     N=args.N, ask_N=not args.no_ask_N,
+                                     N=args.N, #ask_N=not args.no_ask_N,
                                      cfg=cfg, working_crs=wcrs)
         if arrays:
             print("\nExported arrays:")
