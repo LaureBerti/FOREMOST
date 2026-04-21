@@ -95,6 +95,122 @@ foremost --write-config    # creates conf/foremost.yaml
 annotate --write-config    # creates conf/annotator.yaml
 ```
 
+## Annotation Tool
+
+The annotation tool is a Tkinter-based GUI for labelling an N×N grid over a satellite image or GeoPackage. It produces the `.npy` arrays that the optimizer consumes.
+
+### Launching
+
+```bash
+# File picker dialog (choose image or GPKG interactively)
+annotate
+
+# Pre-load a GeoTIFF
+annotate --image input/PEC/zone.tif
+
+# Pre-load a GeoPackage
+annotate --gpkg input/PEC/PEC.gpkg
+
+# Change grid size (default: 30×30)
+annotate --image zone.tif --N 40
+
+# Brazil Atlantic Forest — use SIRGAS 2000 / UTM 25S coordinates
+annotate --image zone.tif --working-crs EPSG:31985
+
+# Generate a config template
+annotate --write-config          # writes conf/annotator.yaml
+
+# Hydra overrides (dot-notation, no -- prefix)
+annotate layers.roads.enabled=true layers.roads.path=input/roads.gpkg
+annotate cost.default_cost=200 data.N=50
+```
+
+### Cell Classes
+
+Each grid cell is assigned one of three classes. Click or drag to paint:
+
+| Class | Key | Colour | Meaning | Effect on arrays |
+|-------|-----|--------|---------|-----------------|
+| **Habitat** | `h` | Dark green | Existing native vegetation | `habitat=1` |
+| **Restorable** | `r` | Orange | Degraded land eligible for restoration | `restorable=1`, `accessible=1` |
+| **Non-Restorable** | `n` | Grey | Infrastructure, water, or excluded land | `restorable=0`, `accessible=0` |
+
+Unannotated cells (light grey) are excluded from optimization.
+
+### Mouse and Keyboard Controls
+
+| Action | How |
+|--------|-----|
+| Paint cell | Left-click |
+| Paint multiple cells | Click and drag |
+| Pan (zoomed in) | Right-click drag, or arrow keys |
+| Zoom in / out | Scroll wheel, or `=` / `-` |
+| Reset zoom | `0` |
+| Set per-cell cost | Enter a value in the cost field, then click the cell |
+| Clear cell | `Delete` or `Backspace` |
+| Undo | `Ctrl+Z` |
+| Export | `Ctrl+S` or the Export button |
+
+### Overlay Layers
+
+Four optional layers can be superimposed on the base image to guide annotation. Each has an independent visibility toggle and transparency slider.
+
+| Layer | YAML key | What to provide |
+|-------|----------|----------------|
+| **Elevation** | `layers.elevation.path` | DEM GeoTIFF or GPKG with a `DN` field |
+| **Roads** | `layers.roads.path` | Road network GPKG/Shapefile — also used to compute the accessibility matrix |
+| **Cadastral** | `layers.cadastral.path` | Land parcel GPKG/Shapefile |
+| **Hydrology** | `layers.hydrology.path` | Waterway GPKG/Shapefile |
+
+Enable layers in `conf/annotator.yaml`:
+
+```yaml
+layers:
+  roads:
+    enabled: true
+    path: "input/PEC/ROADS.gpkg"
+    alpha: 0.65
+  elevation:
+    enabled: true
+    path: "input/PEC/DEM.tif"
+    alpha: 0.35
+```
+
+Or pass directly at launch:
+
+```bash
+annotate layers.roads.enabled=true layers.roads.path=input/roads.gpkg \
+         layers.elevation.enabled=true layers.elevation.path=input/dem.tif
+```
+
+### Auto-annotation
+
+Two one-click helpers speed up labelling:
+
+- **Auto-label Habitat from image** — marks unannotated cells as Habitat when more than 95% of their pixels are non-black (configurable via `ui.auto_hab_threshold`).
+- **Compute accessibility matrix** — uses the loaded road network (from `layers.roads.path`) to mark cells that contain or are within `max_distance_m` of a road as accessible.
+
+### Export
+
+Click **Export** (or press `Ctrl+S`) to write all output files to the folder you select. If `cost.auto_fill` is `true` (default), any Restorable cell with no cost set receives `cost.default_cost` automatically.
+
+| File | Description |
+|------|-------------|
+| `annotation_habitat_N30.npy` | Binary (N, N) — existing habitat cells |
+| `annotation_restorable_N30.npy` | Binary (N, N) — candidate restoration cells |
+| `annotation_accessible_N30.npy` | Binary (N, N) — cells reachable by road network |
+| `annotation_cost_N30.npy` | Float (N, N) — per-cell restoration cost |
+| `annotation_elevation_N30.npy` | Float (N, N) in [0, 1] — normalised elevation (only if elevation layer loaded) |
+| `annotation_annotated_N30.png` | Full-resolution annotated map with legend |
+| `annotation_session_N30.json` | Full session state — reload-able in a future session |
+| `annotation_annotated_N30.gpkg` | Annotated polygons (only when source is a GeoPackage) |
+
+Pass the output folder to the optimizer with:
+
+```bash
+foremost --mode 1 --npy-folder outputs/
+```
+
 ## Python API
 
 ```python
