@@ -153,8 +153,20 @@ class DataConfig:
  
 @dataclass
 class CostConfig:
-    default_cost:  float = 100.0    # $ applied to CLASS_RA cells with no cost
-    auto_fill:     bool  = True     # auto-fill on export if True
+    default_cost:           float = 100.0   # $ applied to CLASS_RA cells with no cost
+    auto_fill:              bool  = True    # auto-fill on export if True
+    tree_unit_cost:         float = 30.0   # € per planted tree
+    tree_spacing_m:         float = 2.0    # metres between trees (planting density)
+    cell_size_m:            float = 100.0  # side length of one planning unit (m)
+    inaccessible_surcharge: float = 0.40   # fractional cost increase for inaccessible cells
+    elevation_base_m:       float = 0.0    # reference elevation (m)
+    elevation_slope:        float = 0.005  # cost increase per metre above base
+    max_elevation_m:        float = 1000.0 # used to scale normalised elevation [0,1] → metres
+    noise_sigma:            float = 0.05   # multiplicative noise σ
+    road_penalty_slope:     float = 0.0002  # fractional cost increase per metre from road (0.02%/m = +20% per 100 m)
+    water_penalty_slope:    float = 0.0001  # fractional cost increase per metre from water
+    road_ref_dist_m:        float = 500.0   # no road penalty within this distance (m)
+    water_ref_dist_m:       float = 200.0   # no water penalty within this distance (m)
  
 @dataclass
 class UIConfig:
@@ -400,46 +412,21 @@ class AnnotationGrid:
     def to_arrays(self) -> dict[str, np.ndarray]:
         """
         Convert annotations to FOREMOST-compatible arrays.
-        Parameters
-        ----------
-        elevation_img : np.ndarray (H×W) or (H×W×C), dtype uint8, optional
-            Elevation layer image (the PIL RGBA array stored in the renderer).
-            When provided, it is converted to a normalised (N×N) float64 array
-            with values in [0, 1].  Each cell receives the mean luminance of
-            the pixels that fall within it.  The result is saved alongside
-            the other arrays as ``elevation``.
-        N : int, optional
-            Grid size.  Inferred from ``self.N`` when None.
 
         Returns
         -------
         dict with keys:
-            ``habitat``    (N, N) int    — 1 = habitat present
-            ``restorable`` (N, N) int    — 1 = CLASS_RA cell
-            ``accessible`` (N, N) int    — same as restorable
-            ``cost``       (N, N) float  — restoration cost (0 where not RA)
-            ``elevation``  (N, N) float  — normalised elevation [0, 1];
-                                           included only when *elevation_img*
-                                           is provided and non-None.
+            ``habitat``    (N, N) int   — 1 where CLASS_HAB
+            ``restorable`` (N, N) int   — 1 where CLASS_RA
+            ``accessible`` (N, N) int   — same as restorable (CLASS_RA = accessible)
+            ``cost``       (N, N) float — restoration cost (0 where not CLASS_RA)
         """
         habitat    = (self.labels == CLASS_HAB).astype(int)
         restorable = (self.labels == CLASS_RA ).astype(int)
-        print("Restorable Matrix:\n", restorable)
-
-        #accessible = restorable.copy() if manually defined
-        cfg= AnnotatorConfig()
-        cfg.layers.roads.path = "./input/ROADS_acorda.gpkg"
-        pil_bg, sq_w, sq4, gdf =_load_gpkg_with_meta(path=cfg.layers.roads.path, layer=None,size=800,working_crs= CRS_WEB_MERCATOR)
-
-        accessible = compute_accessibility_from_roads(cfg=cfg,sq_bounds=sq_w,N=30,max_distance_m=100,working_crs=CRS_WEB_MERCATOR)
-        print("Accessible Matrix (max. 500 m from roads):\n", accessible)
-        rest_acc=np.add(restorable,accessible)
-        rest_acc[rest_acc<2]=0
-        print("Accessible & Restorable Matrix:\n", rest_acc/2)
-
+        accessible = restorable.copy()   # CLASS_RA cells are accessible by definition
         cost       = self.costs.copy()
         return dict(habitat=habitat, restorable=restorable,
-                    accessible=rest_acc/2, cost=cost)
+                    accessible=accessible, cost=cost)
 
     # ── persistence ───────────────────────────────────────────────────────────
  
@@ -2529,6 +2516,7 @@ class Annotator(tk.Tk):
         self.title("FOREMOST — Annotation Tool")
         self.resizable(False, False)
         self.configure(bg=BG_DARK)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
  
         self._cfg          = cfg or AnnotatorConfig()
         ui                 = self._cfg.ui
@@ -2547,12 +2535,15 @@ class Annotator(tk.Tk):
         self._canvas_img_id = None
         self._inline_entry = self._inline_entry_row = self._inline_entry_col = None
         self._pan_last_x   = self._pan_last_y = None
+        self._ctrl_pan_active = False
         self._drag_last_cell: Optional[Tuple[int,int]] = None
         self.result_arrays = None
         self.result_gdf    = None
  
         # Default cost
         self._default_cost_var = tk.DoubleVar(value=self._cfg.cost.default_cost)
+        self._tree_cost_var    = tk.DoubleVar(value=self._cfg.cost.tree_unit_cost)
+        self._cell_size_var    = tk.DoubleVar(value=self._cfg.cost.cell_size_m)
  
         # Layer vars (checkbox + alpha scale per layer)
         self._layer_vis_vars:   Dict[str, tk.BooleanVar] = {}
@@ -2580,6 +2571,8 @@ class Annotator(tk.Tk):
         else:
             bg = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (15,15,30,255))
  
+        self._bg_img   = bg
+        self._n_var    = tk.IntVar(value=N)
         self._renderer = GridRenderer(bg, N, canvas_size=CANVAS_SIZE,
                                        sq_bounds_3857=sq_bounds_3857,
                                        sq_bounds_4326=sq_bounds_4326)
@@ -2602,16 +2595,18 @@ class Annotator(tk.Tk):
         left = tk.Frame(self, bg=BG_DARK)
         left.pack(side=tk.LEFT, padx=10, pady=10)
  
-        tk.Label(left, text=f"{self._source_label}  —  {self._N}×{self._N} grid",
+        self._title_var = tk.StringVar(
+            value=f"{self._source_label}  —  {self._N}×{self._N} grid")
+        tk.Label(left, textvariable=self._title_var,
                  font=FONT_TITLE, fg=FG_LIGHT, bg=BG_DARK).pack(pady=(0, 4))
+ 
+        self._build_zoom_bar(left)
  
         self._canvas = tk.Canvas(
             left, width=CANVAS_SIZE, height=CANVAS_SIZE,
             cursor="crosshair", highlightthickness=2,
             highlightbackground=ACCENT)
         self._canvas.pack()
- 
-        self._build_zoom_bar(left)
  
         self._coord_var = tk.StringVar(value="Cell: —")
         tk.Label(left, textvariable=self._coord_var,
@@ -2631,10 +2626,10 @@ class Annotator(tk.Tk):
  
     def _build_zoom_bar(self, parent):
         bar = tk.Frame(parent, bg=BG_MID)
-        bar.pack(fill=tk.X, pady=(4, 0))
-        btn = dict(font=FONT_SMALL, relief=tk.FLAT, padx=8, pady=3,
-                   bg=BG_PANEL, fg=FG_LIGHT,
-                   activeforeground=FG_LIGHT, activebackground=BG_DARK)
+        bar.pack(fill=tk.X, pady=(0, 4))
+        btn = dict(font=FONT_SMALL, relief=tk.RAISED, padx=8, pady=3,
+                   bg="#ffffff", fg="#000000",
+                   activeforeground="#000000", activebackground="#dddddd")
         tk.Button(bar, text="−", command=self._do_zoom_out, **btn).pack(
             side=tk.LEFT, padx=(4, 0))
         tk.Button(bar, text="+", command=self._do_zoom_in, **btn).pack(
@@ -2645,8 +2640,20 @@ class Annotator(tk.Tk):
         tk.Label(bar, textvariable=self._zoom_var, font=FONT_SMALL,
                  fg=ACCENT, bg=BG_MID, width=12, anchor=tk.E).pack(
                      side=tk.RIGHT, padx=(0, 6))
-        tk.Label(bar, text="right-drag/↑↓←→ = pan",
+        tk.Label(bar, text="drag/↑↓←→=pan",
                  font=FONT_SMALL, fg=FG_DIM, bg=BG_MID).pack(side=tk.RIGHT, padx=4)
+        tk.Label(bar, text="│", font=FONT_SMALL, fg=FG_DIM, bg=BG_MID
+                 ).pack(side=tk.RIGHT)
+        tk.Button(bar, text="↺", command=self._apply_grid_size,
+                  font=FONT_SMALL, relief=tk.RAISED, padx=6, pady=3,
+                  bg="#ffffff", fg="#000000",
+                  activeforeground="#000000", activebackground="#dddddd",
+                  ).pack(side=tk.RIGHT, padx=(0, 2))
+        tk.Spinbox(bar, textvariable=self._n_var, from_=5, to=500, increment=5,
+                   width=5, font=FONT_SMALL, justify=tk.CENTER,
+                   ).pack(side=tk.RIGHT, padx=2)
+        tk.Label(bar, text="Grid N:", font=FONT_SMALL, fg=FG_LIGHT, bg=BG_MID,
+                 ).pack(side=tk.RIGHT, padx=(8, 0))
  
     # ── class selector ────────────────────────────────────────────────────────
  
@@ -2807,43 +2814,62 @@ class Annotator(tk.Tk):
                   relief=tk.FLAT, padx=5, pady=2,
                   command=self._apply_default_cost).pack(side=tk.LEFT)
  
+        # model cost row
+        row2 = tk.Frame(frame, bg=BG_DARK)
+        row2.pack(fill=tk.X, padx=6, pady=(0, 4))
+        tk.Label(row2, text="€/tree:", font=FONT_SMALL,
+                 fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT)
+        tk.Entry(row2, textvariable=self._tree_cost_var,
+                 font=FONT_MONO, width=6, bg=BG_MID, fg=FG_LIGHT,
+                 insertbackground=FG_LIGHT, relief=tk.FLAT, bd=3,
+                 ).pack(side=tk.LEFT, padx=(2, 6))
+        tk.Label(row2, text="cell m:", font=FONT_SMALL,
+                 fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT)
+        tk.Entry(row2, textvariable=self._cell_size_var,
+                 font=FONT_MONO, width=7, bg=BG_MID, fg=FG_LIGHT,
+                 insertbackground=FG_LIGHT, relief=tk.FLAT, bd=3,
+                 ).pack(side=tk.LEFT, padx=(2, 6))
+        tk.Button(row2, text="Fill model costs",
+                  font=FONT_SMALL, fg="#0a0a0a", bg=BG_MID,
+                  relief=tk.FLAT, padx=5, pady=2,
+                  command=self._fill_computed_costs).pack(side=tk.LEFT)
+ 
     # ── statistics panel ──────────────────────────────────────────────────────
  
     def _build_stats_panel(self, parent):
         frame = tk.LabelFrame(
             parent, text="  STATISTICS",
-            font=FONT_LABEL, fg=FG_LIGHT,
-            bg=BG_DARK, bd=1, relief=tk.GROOVE, padx=6, pady=6)
-        frame.pack(fill=tk.X, padx=6, pady=(4, 4))
+            font=FONT_SMALL, fg=FG_DIM,
+            bg=BG_DARK, bd=1, relief=tk.GROOVE, padx=4, pady=2)
+        frame.pack(fill=tk.X, padx=6, pady=(2, 2))
  
         self._stat_vars = {}
         for cls in range(N_CLASSES + 1):
             meta = CLASS_META[cls]
             rf   = tk.Frame(frame, bg=BG_DARK)
-            rf.pack(fill=tk.X, pady=1)
+            rf.pack(fill=tk.X)
             r, g, b = meta["rgb"]
-            tk.Label(rf, width=2, bg=f"#{r:02x}{g:02x}{b:02x}",
-                     relief=tk.FLAT).pack(side=tk.LEFT, padx=(0,5))
-            tk.Label(rf, text=meta["label"][:24], font=FONT_SMALL,
+            tk.Label(rf, width=1, bg=f"#{r:02x}{g:02x}{b:02x}",
+                     relief=tk.FLAT).pack(side=tk.LEFT, padx=(0,4))
+            tk.Label(rf, text=meta["label"][:18], font=FONT_SMALL,
                      fg=FG_DIM, bg=BG_DARK, anchor=tk.W).pack(
                          side=tk.LEFT, fill=tk.X, expand=True)
             var = tk.StringVar(value="0")
             self._stat_vars[cls] = var
             tk.Label(rf, textvariable=var, font=FONT_MONO,
-                     fg=FG_LIGHT, bg=BG_DARK, width=5, anchor=tk.E).pack(side=tk.RIGHT)
+                     fg=FG_LIGHT, bg=BG_DARK, width=4, anchor=tk.E).pack(side=tk.RIGHT)
  
-        tk.Frame(frame, bg=BG_MID, height=1).pack(fill=tk.X, pady=(4,2))
         cr = tk.Frame(frame, bg=BG_DARK)
-        cr.pack(fill=tk.X)
+        cr.pack(fill=tk.X, pady=(2, 0))
         tk.Label(cr, text="Coverage:", font=FONT_SMALL, fg=FG_DIM,
                  bg=BG_DARK).pack(side=tk.LEFT)
         self._cov_var = tk.StringVar(value="0.0 %")
         tk.Label(cr, textvariable=self._cov_var, font=FONT_MONO,
                  fg=ACCENT, bg=BG_DARK).pack(side=tk.RIGHT)
-        self._cov_bar_frame = tk.Frame(frame, bg=BG_MID, height=5)
-        self._cov_bar_frame.pack(fill=tk.X, pady=(2,0))
-        self._cov_bar = tk.Frame(self._cov_bar_frame, bg=ACCENT, height=5, width=0)
-        self._cov_bar.place(x=0, y=0, height=5)
+        self._cov_bar_frame = tk.Frame(frame, bg=BG_MID, height=3)
+        self._cov_bar_frame.pack(fill=tk.X, pady=(1,0))
+        self._cov_bar = tk.Frame(self._cov_bar_frame, bg=ACCENT, height=3, width=0)
+        self._cov_bar.place(x=0, y=0, height=3)
  
     # ── action buttons ────────────────────────────────────────────────────────
  
@@ -2856,6 +2882,7 @@ class Annotator(tk.Tk):
             ("💾  Save session",       self._save_session, BG_MID,    "#0a0a0a"),
             ("📂  Load session",       self._load_session, BG_MID,    "#0a0a0a"),
             ("🗑  Clear all",           self._clear_all,   "#3a1a1a", "#0a0a0a"),
+            ("✖  Exit",                self.destroy,         BG_MID,    "#0a0a0a"),
         ]:
             tk.Button(frame, text=txt, command=cmd, font=FONT_SMALL, fg=fg, bg=bg,
                       activeforeground=fg, activebackground=BG_DARK,
@@ -2900,10 +2927,13 @@ class Annotator(tk.Tk):
  
         self._canvas.bind("<Button-1>",        self._on_canvas_click)
         self._canvas.bind("<B1-Motion>",       self._on_canvas_drag)
-        self._canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag_last_cell", None))
+        self._canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self._canvas.bind("<Button-3>",         self._on_pan_start)
         self._canvas.bind("<B3-Motion>",        self._on_pan_move)
         self._canvas.bind("<ButtonRelease-3>",  self._on_pan_end)
+        self._canvas.bind("<Button-2>",         self._on_pan_start)
+        self._canvas.bind("<B2-Motion>",        self._on_pan_move)
+        self._canvas.bind("<ButtonRelease-2>",  self._on_pan_end)
         self._canvas.bind("<MouseWheel>",  self._on_mousewheel)
         self._canvas.bind("<Button-4>",
             lambda e: (self._renderer.zoom_at(ZOOM_STEP, e.x, e.y),
@@ -2938,7 +2968,7 @@ class Annotator(tk.Tk):
         self._renderer.pan_pixels(dx, dy)
         self._refresh()
  
-    # ── right-click pan ───────────────────────────────────────────────────────
+    # ── pan (right-click, middle-click, Ctrl+left-drag) ──────────────────────
  
     def _on_pan_start(self, event):
         self._pan_last_x = event.x; self._pan_last_y = event.y
@@ -2954,9 +2984,15 @@ class Annotator(tk.Tk):
     def _on_pan_end(self, event):
         self._pan_last_x = None; self._canvas.config(cursor="crosshair")
  
-    # ── left-click annotation ─────────────────────────────────────────────────
+    # ── left-click annotation (Ctrl+left-click/drag → pan) ────────────────────
  
     def _on_canvas_click(self, event):
+        if event.state & 0x4:          # Control held → start pan
+            self._ctrl_pan_active = True
+            self._pan_last_x = event.x
+            self._pan_last_y = event.y
+            self._canvas.config(cursor="fleur")
+            return
         if self._inline_entry is not None:
             r, c = self._renderer.cell_at(event.x, event.y)
             if (r, c) != (self._inline_entry_row, self._inline_entry_col):
@@ -2966,7 +3002,22 @@ class Annotator(tk.Tk):
         self._select_cell(row, col)
         self._annotate_cell(row, col)
  
+    def _on_canvas_release(self, event):
+        if self._ctrl_pan_active:
+            self._ctrl_pan_active = False
+            self._pan_last_x = None
+            self._canvas.config(cursor="crosshair")
+        self._drag_last_cell = None
+ 
     def _on_canvas_drag(self, event):
+        if self._ctrl_pan_active:      # Ctrl+left-drag → pan
+            if self._pan_last_x is None: return
+            self._renderer.pan(event.x - self._pan_last_x,
+                               event.y - self._pan_last_y)
+            self._pan_last_x = event.x
+            self._pan_last_y = event.y
+            self._refresh()
+            return
         row, col = self._renderer.cell_at(event.x, event.y)
         if (row, col) == self._drag_last_cell:
             return
@@ -3274,6 +3325,115 @@ class Annotator(tk.Tk):
         messagebox.showinfo("Default cost applied",
                             f"{n} cell(s) updated with default cost = {default:g} $.")
  
+    def _fill_computed_costs(self):
+        """Compute ecological restoration costs and fill all CLASS_RA cells.
+
+        Formula:
+            cost = (cell_m2 / spacing_m2) x euro/tree
+                   x elev_factor
+                   x road_factor      (penalises distance to road network)
+                   x water_factor     (penalises distance to water network)
+                   x noise
+
+            elev_factor  = 1 + elev_slope  x max(0, elev_m  - elev_base_m)
+            road_factor  = 1 + road_slope  x max(0, dist_road_m  - road_ref_m)
+            water_factor = 1 + water_slope x max(0, dist_water_m - water_ref_m)
+        """
+        try:
+            tree_unit_cost = float(self._tree_cost_var.get())
+            cell_size_m    = float(self._cell_size_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Invalid parameters",
+                                   "\u20ac/tree and cell m must be positive numbers.")
+            return
+        if tree_unit_cost <= 0 or cell_size_m <= 0:
+            messagebox.showwarning("Invalid parameters",
+                                   "\u20ac/tree and cell m must be positive numbers.")
+            return
+
+        cfg = self._cfg.cost
+        N   = self._N
+        sq  = self._renderer.sq_bounds_3857
+        crs = self._working_crs
+
+        ra_mask = self._grid.labels == CLASS_RA   # bool (N, N)
+
+        # elevation in approximate metres
+        elev_img = self._renderer._layer_imgs.get("elevation")
+        if elev_img is not None:
+            elev_norm = _elevation_img_to_array(elev_img, N)
+            elev_m    = elev_norm * getattr(cfg, "max_elevation_m", 1000.0)
+        else:
+            elev_m = np.zeros((N, N), dtype=float)
+
+        # distance to road network (metres)
+        road_path = self._cfg.layers.roads.path
+        if road_path and sq is not None:
+            print("[cost] Computing distance to road network ...")
+            dist_road = _distance_to_layer_m(road_path, sq, N, crs, "[road-dist]")
+        else:
+            dist_road = None
+        if dist_road is None:
+            dist_road = np.zeros((N, N), dtype=float)
+            print("[cost] No road layer -> road penalty = 0")
+
+        # distance to water network (metres)
+        water_path = self._cfg.layers.hydrology.path
+        if water_path and sq is not None:
+            print("[cost] Computing distance to water network ...")
+            dist_water = _distance_to_layer_m(water_path, sq, N, crs, "[water-dist]")
+        else:
+            dist_water = None
+        if dist_water is None:
+            dist_water = np.zeros((N, N), dtype=float)
+            print("[cost] No hydrology layer -> water penalty = 0")
+
+        # cost model parameters
+        spacing_m           = getattr(cfg, "tree_spacing_m",        2.0)
+        elev_base_m         = getattr(cfg, "elevation_base_m",      0.0)
+        elev_slope          = getattr(cfg, "elevation_slope",        0.005)
+        road_penalty_slope  = getattr(cfg, "road_penalty_slope",    0.0002)
+        water_penalty_slope = getattr(cfg, "water_penalty_slope",   0.0001)
+        road_ref_dist_m     = getattr(cfg, "road_ref_dist_m",       500.0)
+        water_ref_dist_m    = getattr(cfg, "water_ref_dist_m",      200.0)
+        noise_sigma         = getattr(cfg, "noise_sigma",            0.05)
+
+        n_trees   = (cell_size_m ** 2) / max(spacing_m ** 2, 1e-9)
+        base_cost = n_trees * tree_unit_cost
+
+        elev_factor  = 1.0 + elev_slope * np.maximum(0.0, elev_m - elev_base_m)
+        road_factor  = 1.0 + road_penalty_slope  * np.maximum(0.0, dist_road  - road_ref_dist_m)
+        water_factor = 1.0 + water_penalty_slope * np.maximum(0.0, dist_water - water_ref_dist_m)
+
+        rng   = np.random.default_rng(0)
+        noise = np.clip(1.0 + rng.normal(0.0, noise_sigma, (N, N)), 0.5, 2.5)
+
+        cost_grid = np.clip(
+            base_cost * elev_factor * road_factor * water_factor * noise,
+            0.0, None)
+
+        # write directly into the grid cost array
+        self._grid.costs[ra_mask] = cost_grid[ra_mask]
+        n_updated = int(ra_mask.sum())
+
+        self._refresh()
+        used = []
+        if elev_img is not None: used.append("elevation")
+        if road_path:            used.append("road dist")
+        if water_path:           used.append("water dist")
+        factors_str = ", ".join(used) if used else "none"
+        if n_updated:
+            mean_c = float(cost_grid[ra_mask].mean())
+            messagebox.showinfo(
+                "Model costs applied",
+                f"{n_updated} cell(s) updated.\n"
+                f"\u20ac/tree={tree_unit_cost:g}  cell={cell_size_m:g} m\n"
+                f"n_trees/cell \u2248 {n_trees:.0f}\n"
+                f"Factors used: {factors_str}\n"
+                f"Mean cost: {mean_c:,.0f} \u20ac")
+        else:
+            messagebox.showinfo("Model costs", "No CLASS_RA cells found.")
+
     # =========================================================================
     # SESSION
     # =========================================================================
@@ -3292,16 +3452,74 @@ class Annotator(tk.Tk):
         if not path: return
         try:
             g = AnnotationGrid.load_json(path)
-            if g.N != self._N:
-                messagebox.showerror("Error",
-                    f"Session N={g.N} incompatible with grid N={self._N}.")
-                return
             self._hide_inline_entry(False)
+            # Auto-adapt grid size if the session was saved with a different N
+            if g.N != self._N:
+                self._N = g.N
+                self._n_var.set(g.N)
+                self._renderer = GridRenderer(
+                    self._bg_img, g.N,
+                    canvas_size=CANVAS_SIZE,
+                    sq_bounds_3857=self._renderer.sq_bounds_3857,
+                    sq_bounds_4326=self._renderer.sq_bounds_4326,
+                )
+                self._sel_row = self._sel_col = None
+                self._title_var.set(
+                    f"{self._source_label}  —  {self._N}×{self._N} grid")
             self._grid = g
             self._refresh()
-            messagebox.showinfo("Loaded", f"Session loaded from:\n{path}")
+            messagebox.showinfo("Loaded", f"Session loaded from:\n{path}\nGrid: {g.N}×{g.N}")
         except Exception as exc:
             messagebox.showerror("Load error", str(exc))
+ 
+    def _exit_and_save(self):
+        """Save session JSON silently then close the window."""
+        import os
+        folder = self._cfg.output.folder or "outputs"
+        os.makedirs(folder, exist_ok=True)
+        stem = Path(self._source_label).stem
+        path = os.path.join(folder, f"{stem}_session_N{self._N}.json")
+        try:
+            self._grid.save_json(path)
+            print(f"  [Exit] Session auto-saved → {path}")
+        except Exception as exc:
+            print(f"  [Exit] Warning: could not save session: {exc}")
+        self.destroy()
+ 
+    def _apply_grid_size(self):
+        """Resize the annotation grid to the N in the spinbox."""
+        try:
+            new_n = int(self._n_var.get())
+        except (ValueError, tk.TclError):
+            return
+        if not (5 <= new_n <= 500):
+            messagebox.showerror("Invalid N",
+                "Grid size must be between 5 and 500.")
+            return
+        if new_n == self._N:
+            return
+        # Warn if annotations exist
+        if self._grid.coverage() > 0:
+            if not messagebox.askyesno(
+                "Change grid size",
+                (f"Resize grid from {self._N}×{self._N} to {new_n}×{new_n}?\n\n"
+                 "Current annotations will be cleared.")):
+                self._n_var.set(self._N)
+                return
+        self._hide_inline_entry(False)
+        self._N    = new_n
+        self._grid = AnnotationGrid(new_n)
+        self._renderer = GridRenderer(
+            self._bg_img, new_n,
+            canvas_size=CANVAS_SIZE,
+            sq_bounds_3857=self._renderer.sq_bounds_3857,
+            sq_bounds_4326=self._renderer.sq_bounds_4326,
+        )
+        self._sel_row = self._sel_col = None
+        self._title_var.set(
+            f"{self._source_label}  —  {self._N}×{self._N} grid")
+        self._refresh()
+        print(f"  [Grid] Resized to {new_n}×{new_n}")
  
     # =========================================================================
     # EXPORT
@@ -3322,7 +3540,25 @@ class Annotator(tk.Tk):
         arrays   = self._grid.to_arrays()
         coverage = self._grid.coverage()
         counts   = self._grid.counts()
- 
+
+        # ── road-network accessibility (only during export, never on exit) ─────
+        road_path = self._cfg.layers.roads.path
+        sq        = self._renderer.sq_bounds_3857
+        if road_path and sq is not None:
+            print("[Export] Computing road-network accessibility …")
+            try:
+                acc = compute_accessibility_from_roads(
+                    self._cfg, sq, self._N,
+                    max_distance_m=500.0,
+                    working_crs=self._working_crs,
+                )
+                arrays["accessible"] = acc
+                print(f"[Export] Accessibility computed: "
+                      f"{int(acc.sum())}/{self._N**2} cells accessible")
+            except Exception as exc:
+                print(f"[Export] Warning: road accessibility skipped — {exc}")
+        # ─────────────────────────────────────────────────────────────────────
+
         if coverage < 100.0:
             if not messagebox.askyesno(
                 "Incomplete export",
@@ -3483,6 +3719,81 @@ def _map_grid_to_gdf(grid: AnnotationGrid,
 # =============================================================================
 # 9.  ROAD-BASED ACCESSIBILITY MATRIX  (from local GPKG road network)
 # =============================================================================
+
+def _distance_to_layer_m(
+    path: str,
+    sq_bounds: Tuple[float, float, float, float],
+    N: int,
+    working_crs: str = CRS_WEB_MERCATOR,
+    tag: str = "[dist]",
+) -> Optional[np.ndarray]:
+    """
+    Compute an N×N array of distances (metres) from each cell centroid
+    to the nearest feature in a vector GPKG/SHP file.
+
+    Works for both line networks (roads, rivers) and polygon layers (water bodies).
+    Returns None if the file is missing, empty, or geopandas/scipy are not installed.
+    """
+    if not path or not Path(path).exists():
+        print(f"{tag} File not found or not configured: {path!r}")
+        return None
+    try:
+        import geopandas as gpd
+        from scipy.spatial import cKDTree
+    except ImportError as e:
+        print(f"{tag} Missing dependency: {e}")
+        return None
+
+    gdf = _load_vector_to_working_crs(path, working_crs, tag.strip("[]"))
+    if gdf is None or len(gdf) == 0:
+        print(f"{tag} Empty or failed to load: {path!r}")
+        return None
+
+    # Collect spatial sample points from all geometries
+    sample_pts: list = []
+    INTERP_SPACING = 50.0  # sample every ~50 m along lines
+
+    for geom in gdf.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        geom_type = geom.geom_type
+        parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+        for part in parts:
+            if "LineString" in part.geom_type:
+                # Dense interpolation along the line
+                length = part.length
+                n_pts  = max(2, int(length / INTERP_SPACING) + 1)
+                for i in range(n_pts):
+                    pt = part.interpolate(i / (n_pts - 1), normalized=True)
+                    sample_pts.append((pt.x, pt.y))
+            elif "Polygon" in part.geom_type:
+                # Boundary + centroid
+                sample_pts.append((part.centroid.x, part.centroid.y))
+                for coord in part.exterior.coords:
+                    sample_pts.append(coord[:2])
+            elif "Point" in part.geom_type:
+                sample_pts.append((part.x, part.y))
+
+    if not sample_pts:
+        print(f"{tag} No sample points extracted.")
+        return None
+
+    pts_arr = np.array(sample_pts, dtype=np.float64)
+    print(f"{tag} {len(pts_arr):,} sample points from {len(gdf):,} features")
+
+    # N×N cell centroids (row 0 = top)
+    minx, miny, maxx, maxy = sq_bounds
+    cell_w = (maxx - minx) / N
+    cell_h = (maxy - miny) / N
+    cx = minx + (np.arange(N) + 0.5) * cell_w
+    cy = maxy - (np.arange(N) + 0.5) * cell_h
+    grid_cx, grid_cy = np.meshgrid(cx, cy)
+    centroids = np.column_stack([grid_cx.ravel(), grid_cy.ravel()])
+
+    tree = cKDTree(pts_arr)
+    dists, _ = tree.query(centroids, k=1, workers=-1)
+    return dists.reshape(N, N)
+
 
 def compute_accessibility_from_roads(
     cfg:            "AnnotatorConfig",
@@ -3865,8 +4176,7 @@ def annotate(
     app = Annotator(image_path=image_path, N=N, cfg=cfg,
                               working_crs=working_crs)
     app.mainloop()
-    return (app.result_arrays if hasattr(app, "result_arrays") and app.result_arrays
-            else app._grid.to_arrays())
+    return app.result_arrays if (hasattr(app, "result_arrays") and app.result_arrays) else None
  
  
 def annotate_gpkg(
@@ -3933,11 +4243,7 @@ def annotate_gpkg(
  
     if app.result_gdf is not None:
         return app.result_gdf
-    print("Window closed without export — mapping grid to features …")
-    try:
-        return _map_grid_to_gdf(app._grid, gdf)
-    except Exception as exc:
-        print(f"  Error: {exc}"); return None
+    return None
  
  
 # =============================================================================
@@ -4027,4 +4333,5 @@ def main():
  
 if __name__ == "__main__":
     main()
+    import os; os._exit(0)
  
