@@ -2377,14 +2377,16 @@ class GridRenderer:
                 gd.text((cx, cy), lbl, font=font,
                         fill=(255,255,255,240), anchor="mm")
  
-        # 6. Grid lines
+        # 6. Grid lines — vertical uses px0 (pan_x), horizontal uses py0 (pan_y)
         gd2 = ImageDraw.Draw(base)
         for i in range(self.N + 1):
-            pos = int((i * opc - px0) * sc)
-            if 0 <= pos <= cs:
-                gd2.line([(pos, 0), (pos, cs)],
+            xp = int((i * opc - px0) * sc)
+            if 0 <= xp <= cs:
+                gd2.line([(xp, 0), (xp, cs)],
                          fill=(255,255,255,GRID_ALPHA), width=1)
-                gd2.line([(0, pos), (cs, pos)],
+            yp = int((i * opc - py0) * sc)
+            if 0 <= yp <= cs:
+                gd2.line([(0, yp), (cs, yp)],
                          fill=(255,255,255,GRID_ALPHA), width=1)
  
         return ImageTk.PhotoImage(base)
@@ -2507,6 +2509,7 @@ class Annotator(tk.Tk):
         self._sel_col      = None
         self._cur_class    = tk.IntVar(value=CLASS_HAB)
         self._tk_img       = None
+        self._canvas_img_id = None
         self._inline_entry = self._inline_entry_row = self._inline_entry_col = None
         self._pan_last_x   = self._pan_last_y = None
         self._drag_last_cell: Optional[Tuple[int,int]] = None
@@ -3353,7 +3356,11 @@ class Annotator(tk.Tk):
         sel = ((self._sel_row, self._sel_col)
                if self._sel_row is not None else None)
         self._tk_img = self._renderer.render(self._grid, selected=sel)
-        self._canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
+        if self._canvas_img_id is None:
+            self._canvas_img_id = self._canvas.create_image(
+                0, 0, anchor=tk.NW, image=self._tk_img)
+        else:
+            self._canvas.itemconfig(self._canvas_img_id, image=self._tk_img)
  
         counts = self._grid.counts()
         for cls, var in self._stat_vars.items():

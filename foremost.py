@@ -1120,6 +1120,7 @@ class RestorationProblem(ElementwiseProblem):
         objective: ObjectiveType = ObjectiveType.MESH,
         penalty: float = 1e6,
         iic_max_dist: int = 10,
+        cell_size_m: float = 100.0,
     ):
         # Assign before super().__init__() — see class docstring
         self.habitat_data = data
@@ -1127,6 +1128,7 @@ class RestorationProblem(ElementwiseProblem):
         self.objective = objective
         self.penalty = penalty
         self.iic_max_dist = iic_max_dist
+        self.cell_size_m = cell_size_m
 
         cr, cc = np.where(data.candidate_mask)
         self._candidate_rows = cr
@@ -1164,7 +1166,7 @@ class RestorationProblem(ElementwiseProblem):
 
         # ---- NC5: precompute per-candidate slope mask --------------------
         if np.isfinite(constraints.max_slope_deg) and data.elevation is not None:
-            slope_grid = compute_slope(data.elevation, cell_size_m=100.0)
+            slope_grid = compute_slope(data.elevation, cell_size_m=cell_size_m)
             self._cand_slope = slope_grid[cr, cc]
         else:
             self._cand_slope = None
@@ -2292,12 +2294,13 @@ class ForemostProblemBuilder:
     ... )
     """
 
-    def __init__(self, data: HabitatData):
+    def __init__(self, data: HabitatData, cell_size_m: float = 100.0):
         self._data = data
         self._objective = ObjectiveType.MESH
         self._constraints = RestorationConstraints()
         self._penalty = 1e6
         self._iic_max_dist = 10
+        self._cell_size_m = cell_size_m
 
     # ── objectives ────────────────────────────────────────────────────────────
     def set_max_mesh_objective(self) -> "ForemostProblemBuilder":
@@ -2388,6 +2391,7 @@ class ForemostProblemBuilder:
             objective=self._objective,
             penalty=self._penalty,
             iic_max_dist=self._iic_max_dist,
+            cell_size_m=self._cell_size_m,
         )
 
     def solve(
@@ -2597,10 +2601,12 @@ def _run_all_objectives(
                 .add_budget_constraint(max_cost=cfg.constraints.max_cost)
                 .solve(pop_size=ps, n_gen=ng, seed=sd, verbose=vb, algo=a))
 
+    cell_size_m = cfg.cost.cell_size_m  # propagate from config to problem
+
     # ── 1. Maximise MESH ──────────────────────────────────────────────────────
 
     print(f"\n{tag} --- 1/7  Maximise MESH ---")
-    r_mesh = _solve(ForemostProblemBuilder(data).set_max_mesh_objective(), True)
+    r_mesh = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_max_mesh_objective(), True)
     plot_solution(
         data,
         r_mesh["solutions"][0],
@@ -2613,7 +2619,7 @@ def _run_all_objectives(
 
     # ── 2. Maximise IIC ──────────────────────────────────────────────────────
     print(f"\n{tag} --- 2/7  Maximise IIC ---")
-    r_iic = _solve(ForemostProblemBuilder(data).set_max_iic_objective(), True)
+    r_iic = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_max_iic_objective(), True)
     plot_solution(
         data,
         r_iic["solutions"][0],
@@ -2641,7 +2647,7 @@ def _run_all_objectives(
     # ── 3. Minimize Cost ──────────────────────────────────────────────────────
     #
     print(f"\n{tag} --- 3/7  Minimise Cost ---")
-    r_cost = _solve(ForemostProblemBuilder(data).set_min_cost_objective(), True)
+    r_cost = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_min_cost_objective(), True)
     plot_solution(
         data,
         r_cost["solutions"][0],
@@ -2653,7 +2659,7 @@ def _run_all_objectives(
     )
 
     # print(f"\n--- 2/7  Maximise IIC  [{algo}] ---")
-    # r_iic = _solve(ForemostProblemBuilder(data).set_max_iic_objective())
+    # r_iic = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_max_iic_objective())
     #          # .add_restorable_constraint(min_restore=min_restore, max_restore=max_restore)
     #          # .add_compactness_constraint(max_diameter=max_diameter)
     #          # .add_connected_constraint(max_nb_cc=max_nb_cc)
@@ -2663,7 +2669,7 @@ def _run_all_objectives(
     #
     # # ── 3. Minimise COST ─────────────────────────────────────────────────────
     # print(f"\n--- 3/7  Minimise Cost  [{algo}] ---")
-    # r_cost = (ForemostProblemBuilder(data).set_min_cost_objective()
+    # r_cost = (ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_min_cost_objective()
     #           .add_restorable_constraint(min_restore=min_restore, max_restore=max_restore)
     #           .add_compactness_constraint(max_diameter=max_diameter)
     #           .add_connected_constraint(max_nb_cc=max_nb_cc)
@@ -2688,7 +2694,7 @@ def _run_all_objectives(
 
     # 5. MESH × Cost
     print(f"\n{tag} --- 5/7  Pareto: MESH × Cost  [{algo}] ---")
-    r_mc = _solve(ForemostProblemBuilder(data).set_mesh_cost_objective(), False)
+    r_mc = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_mesh_cost_objective(), False)
     plot_pareto_front(
         r_mc["solutions"],
         ObjectiveType.MESH_COST,
@@ -2700,7 +2706,7 @@ def _run_all_objectives(
 
     # 6. IIC × Cost
     print(f"\n{tag} --- 6/7  Pareto: IIC × Cost  [{algo}] ---")
-    r_ic = _solve(ForemostProblemBuilder(data).set_iic_cost_objective(), False)
+    r_ic = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_iic_cost_objective(), False)
     plot_pareto_front(
         r_ic["solutions"],
         ObjectiveType.IIC_COST,
@@ -2712,7 +2718,7 @@ def _run_all_objectives(
 
     # 7. FULL
     print(f"\n{tag} --- 7/7  Pareto FULL: MESH × IIC × Cost  [{algo}] ---")
-    r_full = _solve(ForemostProblemBuilder(data).set_full_objective(), False)
+    r_full = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_full_objective(), False)
     plot_pareto_front_3d(
         r_full["solutions"],
         algo_name=r_full["algo_name"],

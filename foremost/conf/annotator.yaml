@@ -4,19 +4,19 @@
 
 data:
   image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
-  gpkg_path:  "./input/land_use_classify.gpkg"       # path to GeoPackage
+  gpkg_path:  "./input/PEC/PEC_corrected.gpkg"       # path to GeoPackage
   layer:      ""       # GPKG layer name (empty = first layer)
   N:          30             # grid size N×N
 
 layers:
   elevation:
-    enabled:   false
-    path:      ""      # path to DEM GeoTIFF (empty = try SRTM via elevation pkg)
+    enabled:   true
+    path:      "./input/PEC/ELEVATION_corrected.tif"
     alpha:     0.35
     colormap:  "plasma"
   roads:
     enabled:   false
-    path:      "./input/ROADS_acorda.gpkg" #   path to shapefile/GPKG (empty = fetch from OSM)
+    path:      "./input/PEC/ROADS_corrected.gpkg" #   path to shapefile/GPKG (empty = fetch from OSM)
     alpha:     0.65
     color:     "#e63946"
     linewidth: 1.6
@@ -35,8 +35,13 @@ layers:
     linewidth: 1.4
 
 cost:
-  default_cost: 100.0    # $ per cell applied to CLASS_RA cells with no cost
-  auto_fill:    true   # fill missing costs automatically on export
+  default_cost: 100.0    # € per cell applied to CLASS_RA cells with no cost
+  auto_fill:    true     # fill missing costs automatically on export
+  # Slope-based accessibility filter applied at export time.
+  # Cells where the 75th-percentile terrain slope (computed at native DEM
+  # resolution, aggregated per planning unit) exceeds max_slope_deg are
+  # marked inaccessible regardless of road-network proximity.
+  max_slope_deg: 30.0    # degrees; set to .inf to disable
 
 ui:
   canvas_size:        800

@@ -1202,7 +1202,7 @@ def _render_elevation_layer(
  
         # ── branch B: raster file (GeoTIFF) ──────────────────────────────────
         elif ext in (".tif", ".tiff"):
-            norm_arr = _elevation_from_raster(cfg.path,
+            norm_arr = _elevation_from_raster(cfg.path, sq_bounds_3857, size,
                                                working_crs=working_crs)
  
         else:
@@ -1218,10 +1218,13 @@ def _render_elevation_layer(
         )
         print("  [elevation] No valid elevation file — using synthetic placeholder.")
  
-    # ── resize to (size, size) ────────────────────────────────────────────────
-    arr_u8  = (norm_arr * 255).clip(0, 255).astype(np.uint8)
-    gray    = _PIL.fromarray(arr_u8, "L").resize((size, size), _PIL.LANCZOS)
-    arr_rs  = np.array(gray) / 255.0
+    # ── resize to (size, size) if not already (synthetic fallback may differ) ──
+    if norm_arr.shape == (size, size):
+        arr_rs = norm_arr
+    else:
+        arr_u8 = (norm_arr * 255).clip(0, 255).astype(np.uint8)
+        gray   = _PIL.fromarray(arr_u8, "L").resize((size, size), _PIL.LANCZOS)
+        arr_rs = np.array(gray) / 255.0
  
     # ── apply colormap ────────────────────────────────────────────────────────
     try:
@@ -1447,33 +1450,64 @@ def _elevation_from_vector(
 
 def _elevation_from_raster(
     path:        str,
+    sq_bounds:   Tuple[float, float, float, float],
+    size:        int,
     working_crs: str = CRS_WEB_MERCATOR,
 ) -> Optional[np.ndarray]:
     """
-    Read band 1 of a GeoTIFF DEM, print its CRS, and return a 2nd–98th
-    percentile normalised float64 array.  Returns None on any error.
+    Read band 1 of a GeoTIFF DEM, warp it to *sq_bounds* in *working_crs*,
+    resample to (*size* × *size*) pixels, and return a 2nd–98th percentile
+    normalised float64 array of shape (size, size).  Returns None on error.
+
+    The warp is performed via rasterio.warp.reproject so the output is
+    spatially aligned with the base image regardless of the DEM's native CRS,
+    resolution, or extent.
     """
     try:
         import rasterio
+        from rasterio.warp import reproject, Resampling
+        from rasterio.crs import CRS as RioCRS
+        from rasterio.transform import from_bounds as transform_from_bounds
+
         with rasterio.open(path) as src:
             native_name  = _crs_display_name(src.crs)
             working_name = _crs_display_name(working_crs)
             print(f"  [elevation/raster] File CRS   : {native_name}")
             if str(src.crs) != working_crs:
-                print(f"  [elevation/raster] Note: raster data is in {native_name}; "
-                      f"working CRS is {working_name}.  "
-                      f"Normalised values only — no geometric warp applied.")
+                print(f"  [elevation/raster] Warping    : {native_name}  →  {working_name}")
             else:
                 print(f"  [elevation/raster] ✓ Matches working CRS")
-            arr    = src.read(1).astype(np.float64)
-            nodata = src.nodata
-        if nodata is not None:
-            arr[arr == nodata] = np.nan
+            print(f"  [elevation/raster] Cropping to sq_bounds and resampling to "
+                  f"{size}×{size} px")
+
+            # Build output transform: sq_bounds → (size × size) pixel grid
+            minx, miny, maxx, maxy = sq_bounds
+            dst_transform = transform_from_bounds(minx, miny, maxx, maxy, size, size)
+            dst_crs       = RioCRS.from_user_input(working_crs)
+
+            dst = np.full((size, size), fill_value=np.nan, dtype=np.float32)
+
+            reproject(
+                source        = rasterio.band(src, 1),
+                destination   = dst,
+                src_transform = src.transform,
+                src_crs       = src.crs,
+                src_nodata    = src.nodata,
+                dst_transform = dst_transform,
+                dst_crs       = dst_crs,
+                resampling    = Resampling.bilinear,
+                dst_nodata    = np.nan,
+            )
+
+        arr = dst.astype(np.float64)
+        arr[~np.isfinite(arr)] = np.nan
+
         lo, hi = np.nanpercentile(arr, 2), np.nanpercentile(arr, 98)
         if hi - lo < 1e-9:
-            return np.zeros_like(arr)
+            return np.zeros((size, size), dtype=np.float64)
         norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
         return np.nan_to_num(norm, nan=0.0)
+
     except ImportError:
         print("  [elevation/raster] rasterio required.  pip install rasterio")
     except Exception as exc:
@@ -2378,14 +2412,16 @@ class GridRenderer:
                 gd.text((cx, cy), lbl, font=font,
                         fill=(255,255,255,240), anchor="mm")
  
-        # 6. Grid lines
+        # 6. Grid lines — vertical uses px0 (pan_x), horizontal uses py0 (pan_y)
         gd2 = ImageDraw.Draw(base)
         for i in range(self.N + 1):
-            pos = int((i * opc - px0) * sc)
-            if 0 <= pos <= cs:
-                gd2.line([(pos, 0), (pos, cs)],
+            xp = int((i * opc - px0) * sc)
+            if 0 <= xp <= cs:
+                gd2.line([(xp, 0), (xp, cs)],
                          fill=(255,255,255,GRID_ALPHA), width=1)
-                gd2.line([(0, pos), (cs, pos)],
+            yp = int((i * opc - py0) * sc)
+            if 0 <= yp <= cs:
+                gd2.line([(0, yp), (cs, yp)],
                          fill=(255,255,255,GRID_ALPHA), width=1)
  
         return ImageTk.PhotoImage(base)
@@ -2508,6 +2544,7 @@ class Annotator(tk.Tk):
         self._sel_col      = None
         self._cur_class    = tk.IntVar(value=CLASS_HAB)
         self._tk_img       = None
+        self._canvas_img_id = None
         self._inline_entry = self._inline_entry_row = self._inline_entry_col = None
         self._pan_last_x   = self._pan_last_y = None
         self._drag_last_cell: Optional[Tuple[int,int]] = None
@@ -3354,7 +3391,11 @@ class Annotator(tk.Tk):
         sel = ((self._sel_row, self._sel_col)
                if self._sel_row is not None else None)
         self._tk_img = self._renderer.render(self._grid, selected=sel)
-        self._canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
+        if self._canvas_img_id is None:
+            self._canvas_img_id = self._canvas.create_image(
+                0, 0, anchor=tk.NW, image=self._tk_img)
+        else:
+            self._canvas.itemconfig(self._canvas_img_id, image=self._tk_img)
  
         counts = self._grid.counts()
         for cls, var in self._stat_vars.items():

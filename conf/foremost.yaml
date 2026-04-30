@@ -22,27 +22,41 @@ data:
   accessible_path:  ""
   cost_path:        ""
   locked_out_path:  ""
-  elevation_path:   ""
+  elevation_path:   "input/PEC/ELEVATION_corrected.tif"
+  # CRS / extent of the study area (EPSG:3857).
+  # Used to compute sq_bounds and cell_size_m when running in mode=1.
+  # PEC: Width=319 703 m, Height=664 415 m → square side = 664 415 m.
+  working_crs:      "EPSG:3857"
 
 cost:
   tree_unit_cost:          30.0   # € per tree
-  tree_spacing_m:          2.0   # metres between trees
-  cell_size_m:             100.0      # cell side length in metres
-  inaccessible_surcharge:  0.4
-  elevation_base_m:        0.0
-  elevation_slope:         0.005  # extra cost / metre elevation
-  noise_sigma:             0.05
+  tree_spacing_m:          2.0    # metres between trees (planting density)
+  # cell_size_m MUST equal landscape_sq_extent_m / N for real raster runs.
+  # Wrong value → wrong n_trees per cell and wrong slope gradient (NC5).
+  #   PEC N= 30: 664415 /  30 ≈ 22147 m  → cell_size_m: 22147.0
+  #   PEC N= 60: 664415 /  60 ≈ 11074 m  → cell_size_m: 11074.0
+  #   PEC N=133: 664415 / 133 ≈  4996 m  → cell_size_m:  4996.0
+  # Default 100.0 is correct ONLY for synthetic mode=0.
+  cell_size_m:             100.0
+  inaccessible_surcharge:  0.4    # +40 % cost for road-inaccessible cells
+  elevation_base_m:        0.0    # reference elevation (m); no penalty below this
+  elevation_slope:         0.005  # fractional cost increase per metre of elevation
+  noise_sigma:             0.05   # multiplicative cost noise σ
 
 constraints:
-  # PEC 30×30 grid has 83 candidate cells (restorable & accessible); min_restore must be < 83
-  min_restore: 10.0    # minimum cells to restore (ha at 1 ha/cell)
-  max_restore: 200.0   # generous upper bound — bounded by n_candidates at runtime
-  max_diameter: 10     # compactness: max corridor width = 10 cells = 1 km
-  max_nb_cc: 20        # max connected components (corridors)
+  # All spatial constraints in CELL units — NOT metres.
+  # Recalibrate whenever N changes: physical_size_m = constraint_cells × cell_size_m.
+  #
+  # PEC at N=30 (cell=22 km): min/max_restore are sums of restorable[] values (not cell counts).
+  # PEC at N=133 (cell=5 km): max_diameter=2 → 10 km corridor; iic_max_dist=4 → 20 km dispersal.
+  min_restore: 10.0    # sum of restorable[] values of selected cells (not cell count)
+  max_restore: 200.0   # upper bound — bounded by n_candidates at runtime
+  max_diameter: 10     # max spatial diameter of restored zone in CELLS
+  max_nb_cc: 20        # max connected components
   min_proportion: 0.0
   max_cost: 20000      # EUR budget cap
   min_app_compliance: 0.0   # NC6: fraction of restored cells in APPs (0.0=disabled)
-  max_slope_deg: .inf       # NC5: max terrain slope in degrees (.inf=disabled)
+  max_slope_deg: 30.0       # NC5: max terrain slope (degrees); matches slope-filter in annotation export
   min_patch_size: 0         # NC1: min cells per connected component (0=disabled)
   max_edge_ratio: 1.0       # NC2: max edge-to-area ratio (1.0=disabled)
   min_iic_delta: 0.0        # NC3: min IIC improvement above baseline (0.0=disabled)

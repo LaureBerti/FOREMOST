@@ -1089,6 +1089,7 @@ class RestorationProblem(ElementwiseProblem):
         objective: ObjectiveType = ObjectiveType.MESH,
         penalty: float = 1e6,
         iic_max_dist: int = 10,
+        cell_size_m: float = 100.0,
     ):
         # Assign before super().__init__() — see class docstring
         self.habitat_data = data
@@ -1096,6 +1097,7 @@ class RestorationProblem(ElementwiseProblem):
         self.objective = objective
         self.penalty = penalty
         self.iic_max_dist = iic_max_dist
+        self.cell_size_m = cell_size_m
 
         cr, cc = np.where(data.candidate_mask)
         self._candidate_rows = cr
@@ -1190,7 +1192,7 @@ class RestorationProblem(ElementwiseProblem):
         # Excludes cells on terrain steeper than max_slope_deg.
         # Uses the elevation layer; inactive when elevation is absent.
         if np.isfinite(c.max_slope_deg) and self.habitat_data.elevation is not None:
-            slope = compute_slope(self.habitat_data.elevation, cell_size_m=100.0)
+            slope = compute_slope(self.habitat_data.elevation, cell_size_m=self.cell_size_m)
             if sel.any():
                 sel_slopes = slope[
                     self._candidate_rows[sel], self._candidate_cols[sel]
@@ -2163,12 +2165,13 @@ class ForemostProblemBuilder:
     ... )
     """
 
-    def __init__(self, data: HabitatData):
+    def __init__(self, data: HabitatData, cell_size_m: float = 100.0):
         self._data = data
         self._objective = ObjectiveType.MESH
         self._constraints = RestorationConstraints()
         self._penalty = 1e6
         self._iic_max_dist = 10
+        self._cell_size_m = cell_size_m
 
     # ── objectives ────────────────────────────────────────────────────────────
     def set_max_mesh_objective(self) -> "ForemostProblemBuilder":
@@ -2259,6 +2262,7 @@ class ForemostProblemBuilder:
             objective=self._objective,
             penalty=self._penalty,
             iic_max_dist=self._iic_max_dist,
+            cell_size_m=self._cell_size_m,
         )
 
     def solve(
