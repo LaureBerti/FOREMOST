@@ -3,20 +3,20 @@
 # ──────────────────────────────────────────────────────────────────────────
 
 data:
-  image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
-  gpkg_path:  "./input/PEC/PEC_corrected.gpkg"       # path to GeoPackage
+  image_path: "./input/PEC/May10/LANDUSE_corrected.tif"   # path to PNG/JPG/GeoTIFF
+  gpkg_path:  ""       # path to GeoPackage (.gpkg/.shp/.geojson)
   layer:      ""       # GPKG layer name (empty = first layer)
   N:          30             # grid size N×N
 
 layers:
   elevation:
     enabled:   true
-    path:      "./input/PEC/ELEVATION_corrected.tif"
+    path:      ""   # e.g. "./input/PEC/ELEVATION_corrected.tif"
     alpha:     0.35
     colormap:  "plasma"
   roads:
     enabled:   false
-    path:      "./input/PEC/ROADS_corrected.gpkg" #   path to shapefile/GPKG (empty = fetch from OSM)
+    path:      ""   # e.g. "./input/PEC/ROADS_corrected.gpkg"
     alpha:     0.65
     color:     "#e63946"
     linewidth: 1.6

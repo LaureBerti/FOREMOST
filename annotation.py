@@ -103,6 +103,70 @@ except ImportError:
     print("ERROR: tkinter is required (included in standard Python).")
     sys.exit(1)
  
+# ── macOS file picker (avoids Tcl/AppKit modal-loop SIGSEGV) ─────────────────
+def _pick_file_macos(title: str,
+                     filetypes: list,
+                     save: bool = False,
+                     defaultextension: str = "",
+                     initialfile: str = "",
+                     directory: bool = False,
+                     *,
+                     tk_root=None) -> str:
+    """
+    On macOS use osascript so the dialog runs outside Tcl's event loop.
+    Returns the selected path string, or "" if cancelled.
+    Falls back to tkinter filedialog on non-macOS platforms.
+    """
+    if sys.platform != "darwin":
+        if directory:
+            return filedialog.askdirectory(title=title) or ""
+        elif save:
+            return filedialog.asksaveasfilename(
+                title=title, defaultextension=defaultextension,
+                initialfile=initialfile, filetypes=filetypes) or ""
+        else:
+            return filedialog.askopenfilename(title=title, filetypes=filetypes) or ""
+
+    import subprocess
+    if directory:
+        script = f'POSIX path of (choose folder with prompt "{title}")'
+    elif save:
+        init = f' default name "{initialfile}"' if initialfile else ""
+        script = f'POSIX path of (choose file name{init} with prompt "{title}")'
+    else:
+        # No "of type" filter: AppleScript UTI matching is unreliable for
+        # GIS extensions (.gpkg, .geojson, etc.) and rejects multi-ext patterns.
+        script = f'POSIX path of (choose file with prompt "{title}")'
+    # Lower the annotator behind the dialog so it doesn't block it;
+    # lift it back to front after the dialog closes.
+    if tk_root is not None:
+        try:
+            tk_root.lower()
+            tk_root.update()   # flush pending draws so lower() takes visual effect
+        except Exception:
+            pass
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=300)
+        path = r.stdout.strip()
+        if r.returncode != 0:
+            print(f"[file picker] cancelled or failed (rc={r.returncode}): {r.stderr.strip()}")
+        else:
+            print(f"[file picker] selected: {path!r}")
+        # osascript appends a newline; strip trailing slash from folder picks
+        return path.rstrip("/") if directory else path
+    except Exception as exc:
+        print(f"[file picker] osascript error: {exc}")
+        return ""
+    finally:
+        if tk_root is not None:
+            try:
+                tk_root.lift()
+                tk_root.focus_force()
+            except Exception:
+                pass
+
+
 # ── Hydra / OmegaConf (optional) ─────────────────────────────────────────────
 try:
     import hydra
@@ -149,7 +213,7 @@ class DataConfig:
     image_path: str = ""
     gpkg_path:  str = ""
     layer:      str = ""
-    N:          int = 30
+    N:          int = 500
  
 @dataclass
 class CostConfig:
@@ -173,7 +237,7 @@ class UIConfig:
     canvas_size:        int   = 800
     max_zoom:           float = 16.0
     pan_key_step:       int   = 40
-    auto_hab_threshold: float = 0.95
+    auto_hab_threshold: float = 0.70
     auto_label_threshold: int = 50
     panel_width:        int   = 310
  
@@ -347,8 +411,8 @@ BG_PANEL     = "#0f3460"
 FG_LIGHT     = "#e0e0e0"
 FG_DIM       = "#a0a0b0"
 ACCENT       = "#e94560"
-AUTO_HAB_THRESHOLD = 0.95
-AUTO_LABEL_THRESHOLD = 50
+AUTO_HAB_THRESHOLD = 0.70     # fraction of pixels that determine a cell's class
+AUTO_LABEL_THRESHOLD = 50     # pixel brightness below this is treated as "black/nodata"
  
  
 # =============================================================================
@@ -363,6 +427,7 @@ class AnnotationGrid:
         self.labels  = np.zeros((N, N), dtype=int)
         self.costs   = np.zeros((N, N), dtype=float)
         self._history: list[tuple] = []
+        self.georef: Optional[dict] = None  # spatial metadata: sq_bounds, working_crs, …
  
     # ── mutation ──────────────────────────────────────────────────────────────
 
@@ -430,11 +495,15 @@ class AnnotationGrid:
 
     # ── persistence ───────────────────────────────────────────────────────────
  
-    def save_json(self, path: str):
+    def save_json(self, path: str, georef: Optional[dict] = None):
+        data: dict = {"N": self.N, "labels": self.labels.tolist(),
+                      "costs": self.costs.tolist()}
+        effective_georef = georef if georef is not None else self.georef
+        if effective_georef is not None:
+            data["georef"] = effective_georef
         with open(path, "w") as f:
-            json.dump({"N": self.N, "labels": self.labels.tolist(),
-                       "costs": self.costs.tolist()}, f)
- 
+            json.dump(data, f, indent=2)
+
     @classmethod
     def load_json(cls, path: str) -> "AnnotationGrid":
         with open(path) as f:
@@ -442,6 +511,7 @@ class AnnotationGrid:
         g = cls(d["N"])
         g.labels = np.array(d["labels"], dtype=int)
         g.costs  = np.array(d["costs"],  dtype=float)
+        g.georef = d.get("georef")  # None when loading pre-georef sessions
         return g
  
  
@@ -552,6 +622,21 @@ def _square_crop_resize(img: Image.Image, size: int) -> Image.Image:
     img  = img.crop(((w - sq) // 2, (h - sq) // 2,
                       (w - sq) // 2 + sq, (h - sq) // 2 + sq))
     return img.resize((size, size), Image.LANCZOS).convert("RGBA")
+
+
+def _square_pad_resize(img: Image.Image, size: int) -> Image.Image:
+    """Pad the shorter pixel axis symmetrically to create a square, then resize.
+
+    This is the spatial counterpart of make_square_bounds: both operations
+    are centered and extend the shorter axis, so the geographic extent stored
+    in sq_bounds matches exactly the geographic area visible in the image.
+    Padded areas are fully transparent (RGBA 0,0,0,0).
+    """
+    w, h   = img.size
+    sq     = max(w, h)
+    padded = Image.new("RGBA", (sq, sq), (0, 0, 0, 0))
+    padded.paste(img.convert("RGBA"), ((sq - w) // 2, (sq - h) // 2))
+    return padded.resize((size, size), Image.LANCZOS)
  
  
 # ── generic bounds utilities ──────────────────────────────────────────────────
@@ -951,18 +1036,18 @@ def _load_tiff_with_meta(
                 print(f"  [tiff] Bounds extraction failed: {exc}")
  
         rgb = np.stack([r, g, b], axis=-1)
-        return _square_crop_resize(Image.fromarray(rgb, "RGB"), size), \
+        return _square_pad_resize(Image.fromarray(rgb, "RGB"), size), \
                sq_working, sq4, None
- 
+
     except ImportError:
         pass
     except Exception as exc:
         print(f"  [rasterio] Warning: {exc} — PIL fallback")
- 
+
     img = Image.open(path)
     if img.mode not in ("RGB", "RGBA", "L"):
         img = img.convert("RGB")
-    return _square_crop_resize(img, size), None, None, None
+    return _square_pad_resize(img, size), None, None, None
  
  
 def _load_gpkg_with_meta(
@@ -1379,7 +1464,8 @@ def _elevation_from_vector(
             dtype=np.float64,
             all_touched=True,       # burn pixels touched by edge, not just interior
         )
-        grid = np.flipud(grid)      # rasterio uses top-down; flip to row 0 = top
+        # NOTE: rasterio/from_bounds already places row 0 at maxy (geographic north),
+        # matching PIL's row-0=top convention.  No flip is needed.
 
     # ── 4b. point scatter (no rasterio) ──────────────────────────────────────
     else:
@@ -1608,19 +1694,21 @@ def _render_vector_layer(
     fc      = cfg.facecolor if cfg.facecolor else "none"
     ec      = cfg.color
     lw      = cfg.linewidth
-    is_line = gdf.geometry.geom_type.str.contains("Line").any()
-    is_pt   = gdf.geometry.geom_type.str.contains("Point").any()
- 
     def _plot(ax):
         try:
-            if is_pt:
-                ax.scatter(gdf.geometry.x.values, gdf.geometry.y.values,
+            geom_types = gdf.geometry.geom_type
+            pt_mask   = geom_types.str.contains("Point",  na=False)
+            line_mask = geom_types.str.contains("Line",   na=False)
+            poly_mask = ~pt_mask & ~line_mask
+            if pt_mask.any():
+                pts = gdf[pt_mask]
+                ax.scatter(pts.geometry.x.values, pts.geometry.y.values,
                            s=12, color=ec, zorder=3)
-            elif is_line:
-                gdf.plot(ax=ax, color=ec, linewidth=lw, zorder=3)
-            else:
-                gdf.plot(ax=ax, facecolor=fc, edgecolor=ec,
-                         linewidth=lw, zorder=3)
+            if line_mask.any():
+                gdf[line_mask].plot(ax=ax, color=ec, linewidth=lw, zorder=3)
+            if poly_mask.any():
+                gdf[poly_mask].plot(ax=ax, facecolor=fc, edgecolor=ec,
+                                    linewidth=lw, zorder=3)
         except Exception as exc:
             print(f"  [{layer_name}] Plot error: {exc}")
  
@@ -2502,7 +2590,7 @@ class Annotator(tk.Tk):
     def __init__(
         self,
         image_path:    Optional[str]               = None,
-        N:             int                          = 30,
+        N:             int                          = 500,
         layer:         Optional[str]                = None,
         pil_image:     Optional[Image.Image]        = None,
         source_gdf:    Optional["gpd.GeoDataFrame"] = None,
@@ -2513,10 +2601,26 @@ class Annotator(tk.Tk):
         working_crs: str = CRS_SIRGAS_UTM25S,
     ):
         super().__init__()
+        self.withdraw()          # hide until fully built to avoid tiny flash
         self.title("FOREMOST — Annotation Tool")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.configure(bg=BG_DARK)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+        # Suppress Tcl SIGSEGV on macOS when Apple Events (Reopen/Quit) arrive
+        # without a registered Tcl command handler.
+        try:
+            self.createcommand("::tk::mac::ReopenApplication", lambda: self.lift())
+            self.createcommand("::tk::mac::Quit", self.destroy)
+        except (tk.TclError, AttributeError):
+            pass
+
+        # Reduce annotation canvas to fit the screen height on laptop displays.
+        # Reserve ~200 px for OS chrome (title bar, taskbar), window padding,
+        # zoom bar, title label, and coord label.
+        self.update_idletasks()
+        _screen_h  = self.winfo_screenheight()
+        _canvas_px = max(400, min(CANVAS_SIZE, _screen_h - 200))
+        self._canvas_px = _canvas_px
  
         self._cfg          = cfg or AnnotatorConfig()
         ui                 = self._cfg.ui
@@ -2561,7 +2665,7 @@ class Annotator(tk.Tk):
         elif image_path is not None:
             print(f"Loading {image_path} (working CRS: {working_crs}) …")
             bg, sq_w, sq4, gdf = _load_source_with_meta(
-                image_path, layer, CANVAS_SIZE, working_crs=working_crs)
+                image_path, layer, self._canvas_px, working_crs=working_crs)
             if gdf is not None and source_gdf is None:
                 self._source_gdf = gdf
             if sq_bounds_3857 is None:
@@ -2569,11 +2673,11 @@ class Annotator(tk.Tk):
             if sq_bounds_4326 is None:
                 sq_bounds_4326 = sq4
         else:
-            bg = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (15,15,30,255))
- 
+            bg = Image.new("RGBA", (self._canvas_px, self._canvas_px), (15, 15, 30, 255))
+
         self._bg_img   = bg
         self._n_var    = tk.IntVar(value=N)
-        self._renderer = GridRenderer(bg, N, canvas_size=CANVAS_SIZE,
+        self._renderer = GridRenderer(bg, N, canvas_size=self._canvas_px,
                                        sq_bounds_3857=sq_bounds_3857,
                                        sq_bounds_4326=sq_bounds_4326)
  
@@ -2586,6 +2690,12 @@ class Annotator(tk.Tk):
         self._build_ui()
         self._bind_keys()
         self._refresh()
+        # Show the fully-built window in front of all others
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(200, lambda: self.attributes("-topmost", False))
+        self.focus_force()
  
     # =========================================================================
     # UI CONSTRUCTION
@@ -2594,28 +2704,68 @@ class Annotator(tk.Tk):
     def _build_ui(self):
         left = tk.Frame(self, bg=BG_DARK)
         left.pack(side=tk.LEFT, padx=10, pady=10)
- 
+
         self._title_var = tk.StringVar(
             value=f"{self._source_label}  —  {self._N}×{self._N} grid")
         tk.Label(left, textvariable=self._title_var,
                  font=FONT_TITLE, fg=FG_LIGHT, bg=BG_DARK).pack(pady=(0, 4))
- 
+
         self._build_zoom_bar(left)
- 
+
         self._canvas = tk.Canvas(
-            left, width=CANVAS_SIZE, height=CANVAS_SIZE,
+            left, width=self._canvas_px, height=self._canvas_px,
             cursor="crosshair", highlightthickness=2,
             highlightbackground=ACCENT)
         self._canvas.pack()
- 
+
         self._coord_var = tk.StringVar(value="Cell: —")
         tk.Label(left, textvariable=self._coord_var,
                  font=FONT_SMALL, fg=FG_DIM, bg=BG_DARK).pack(pady=(2, 0))
- 
-        right = tk.Frame(self, bg=BG_DARK, width=PANEL_WIDTH)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=10)
-        right.pack_propagate(False)
- 
+
+        # ── Scrollable right panel ────────────────────────────────────────────
+        # Wrap all control panels in a Canvas+Scrollbar so they are always
+        # reachable on small / laptop screens.
+        right_outer = tk.Frame(self, bg=BG_DARK, width=PANEL_WIDTH)
+        right_outer.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=10)
+        right_outer.pack_propagate(False)
+
+        _inner_w = PANEL_WIDTH - 16          # leave room for scrollbar
+        right_scroll_canvas = tk.Canvas(
+            right_outer, bg=BG_DARK, highlightthickness=0, width=_inner_w)
+        right_sb = tk.Scrollbar(
+            right_outer, orient=tk.VERTICAL, command=right_scroll_canvas.yview)
+        right_scroll_canvas.configure(yscrollcommand=right_sb.set)
+        right_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        right_scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        right = tk.Frame(right_scroll_canvas, bg=BG_DARK, width=_inner_w)
+        _win_id = right_scroll_canvas.create_window((0, 0), window=right, anchor=tk.NW)
+
+        def _update_scrollregion(event=None):
+            right_scroll_canvas.configure(
+                scrollregion=right_scroll_canvas.bbox("all"))
+            right_scroll_canvas.itemconfig(_win_id,
+                                            width=right_scroll_canvas.winfo_width())
+        right.bind("<Configure>", _update_scrollregion)
+        right_scroll_canvas.bind("<Configure>",
+                                  lambda e: right_scroll_canvas.itemconfig(
+                                      _win_id, width=e.width))
+
+        def _on_mousewheel(event):
+            if event.num == 4:
+                right_scroll_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                right_scroll_canvas.yview_scroll(1, "units")
+            else:
+                right_scroll_canvas.yview_scroll(
+                    int(-1 * (event.delta / 120)), "units")
+
+        for widget in (right_scroll_canvas, right_outer):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            widget.bind("<Button-4>",   _on_mousewheel)
+            widget.bind("<Button-5>",   _on_mousewheel)
+        # ─────────────────────────────────────────────────────────────────────
+
         self._build_class_panel(right)
         self._build_layer_panel(right)
         self._build_cost_panel(right)
@@ -2686,33 +2836,31 @@ class Annotator(tk.Tk):
         btn_row = tk.Frame(frame, bg=BG_DARK)
         btn_row.pack(fill=tk.X, pady=(8, 0))
         tk.Button(btn_row, text="✕  Clear cell  [Del]",
-                  font=FONT_SMALL, fg="#ff6b6b", bg=BG_MID,
-                  activeforeground="#ff6b6b", activebackground=BG_DARK,
+                  font=FONT_SMALL, fg="#cc0000", bg="white",
+                  activeforeground="#cc0000", activebackground="#f0d0d0",
                   relief=tk.FLAT, padx=5, pady=3,
                   command=self._clear_selected).pack(side=tk.LEFT, fill=tk.X, expand=True)
         # Auto-annotate button (requires GPKG or image background)
         tk.Button(
             frame, text="🤖 Auto-label Habitat from image",
-            font=FONT_SMALL, fg="#333942", bg=BG_MID,
-            activeforeground="#7ec8e3", activebackground=BG_DARK,
+            font=FONT_SMALL, fg="black", bg="white",
+            activeforeground="black", activebackground="#d0d0d0",
             relief=tk.FLAT, padx=6, pady=4,
             command=self._auto_annotate_habitat,
         ).pack(fill=tk.X, pady=(4, 0))
 
-        # Auto-annotate button (requires GPKG or image background)
         tk.Button(
             frame, text="🤖 Auto-label Non Restorable area from image",
-            font=FONT_SMALL, fg="#333942", bg=BG_MID,
-            activeforeground="#7ec8e3", activebackground=BG_DARK,
+            font=FONT_SMALL, fg="black", bg="white",
+            activeforeground="black", activebackground="#d0d0d0",
             relief=tk.FLAT, padx=6, pady=4,
             command=self._auto_annotate_nohabitat,
         ).pack(fill=tk.X, pady=(4, 0))
 
-        # Auto-annotate button (requires GPKG or image background)
         tk.Button(
             frame, text="🤖 Auto-label remaining cells as Restorable",
-            font=FONT_SMALL, fg="#333942", bg=BG_MID,
-            activeforeground="#7ec8e3", activebackground=BG_DARK,
+            font=FONT_SMALL, fg="black", bg="white",
+            activeforeground="black", activebackground="#d0d0d0",
             relief=tk.FLAT, padx=6, pady=4,
             command=self._auto_annotate_restorable,
         ).pack(fill=tk.X, pady=(4, 0))
@@ -2769,16 +2917,18 @@ class Annotator(tk.Tk):
             # Load button
             tk.Button(
                 row_f, text="Load",
-                font=("Helvetica", 7), fg="#0a0a0a", bg=BG_PANEL,
+                font=("Helvetica", 7), fg="black", bg="white",
+                activeforeground="black", activebackground="#d0d0d0",
                 relief=tk.FLAT, padx=4, pady=1,
                 state=tk.NORMAL if georef else tk.DISABLED,
                 command=lambda n=name: self._load_layer(n),
             ).pack(side=tk.LEFT, padx=(2, 0))
- 
+
             # Change button  (re-opens file dialog even when file already set)
             tk.Button(
                 row_f, text="↺",
-                font=("Helvetica", 8, "bold"), fg="#0a0a0a", bg=BG_PANEL,
+                font=("Helvetica", 8, "bold"), fg="black", bg="white",
+                activeforeground="black", activebackground="#d0d0d0",
                 relief=tk.FLAT, padx=3, pady=1,
                 state=tk.NORMAL if georef else tk.DISABLED,
                 command=lambda n=name: self._load_layer(n, reload=True),
@@ -2805,12 +2955,13 @@ class Annotator(tk.Tk):
                  fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT)
  
         entry = tk.Entry(row, textvariable=self._default_cost_var,
-                         font=FONT_MONO, width=8, bg=BG_MID, fg=FG_LIGHT,
-                         insertbackground=FG_LIGHT, relief=tk.FLAT, bd=3)
+                         font=FONT_MONO, width=8, bg="white", fg="black",
+                         insertbackground="black", relief=tk.FLAT, bd=3)
         entry.pack(side=tk.LEFT, padx=4)
  
         tk.Button(row, text="Fill missing costs",
-                  font=FONT_SMALL, fg="#0a0a0a", bg=BG_MID,
+                  font=FONT_SMALL, fg="black", bg="white",
+                  activeforeground="black", activebackground="#d0d0d0",
                   relief=tk.FLAT, padx=5, pady=2,
                   command=self._apply_default_cost).pack(side=tk.LEFT)
  
@@ -2820,17 +2971,18 @@ class Annotator(tk.Tk):
         tk.Label(row2, text="€/tree:", font=FONT_SMALL,
                  fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT)
         tk.Entry(row2, textvariable=self._tree_cost_var,
-                 font=FONT_MONO, width=6, bg=BG_MID, fg=FG_LIGHT,
-                 insertbackground=FG_LIGHT, relief=tk.FLAT, bd=3,
+                 font=FONT_MONO, width=6, bg="white", fg="black",
+                 insertbackground="black", relief=tk.FLAT, bd=3,
                  ).pack(side=tk.LEFT, padx=(2, 6))
         tk.Label(row2, text="cell m:", font=FONT_SMALL,
                  fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT)
         tk.Entry(row2, textvariable=self._cell_size_var,
-                 font=FONT_MONO, width=7, bg=BG_MID, fg=FG_LIGHT,
-                 insertbackground=FG_LIGHT, relief=tk.FLAT, bd=3,
+                 font=FONT_MONO, width=7, bg="white", fg="black",
+                 insertbackground="black", relief=tk.FLAT, bd=3,
                  ).pack(side=tk.LEFT, padx=(2, 6))
         tk.Button(row2, text="Fill model costs",
-                  font=FONT_SMALL, fg="#0a0a0a", bg=BG_MID,
+                  font=FONT_SMALL, fg="black", bg="white",
+                  activeforeground="black", activebackground="#d0d0d0",
                   relief=tk.FLAT, padx=5, pady=2,
                   command=self._fill_computed_costs).pack(side=tk.LEFT)
  
@@ -2857,7 +3009,7 @@ class Annotator(tk.Tk):
             var = tk.StringVar(value="0")
             self._stat_vars[cls] = var
             tk.Label(rf, textvariable=var, font=FONT_MONO,
-                     fg=FG_LIGHT, bg=BG_DARK, width=4, anchor=tk.E).pack(side=tk.RIGHT)
+                     fg=FG_LIGHT, bg=BG_DARK, width=7, anchor=tk.E).pack(side=tk.RIGHT)
  
         cr = tk.Frame(frame, bg=BG_DARK)
         cr.pack(fill=tk.X, pady=(2, 0))
@@ -2877,23 +3029,24 @@ class Annotator(tk.Tk):
         frame = tk.Frame(parent, bg=BG_DARK)
         frame.pack(fill=tk.X, padx=6, pady=(8, 4))
  
-        for txt, cmd, bg, fg in [
-            #("↩  Undo  [Ctrl+Z]",    self._undo,         BG_MID,    #0a0a0a),
-            ("💾  Save session",       self._save_session, BG_MID,    "#0a0a0a"),
-            ("📂  Load session",       self._load_session, BG_MID,    "#0a0a0a"),
-            ("🗑  Clear all",           self._clear_all,   "#3a1a1a", "#0a0a0a"),
-            ("✖  Exit",                self.destroy,         BG_MID,    "#0a0a0a"),
+        for txt, cmd in [
+            #("↩  Undo  [Ctrl+Z]",    self._undo),
+            ("💾  Save session",       self._save_session),
+            ("📂  Load session",       self._load_session),
+            ("🗑  Clear all",           self._clear_all),
+            ("✖  Exit",                self.destroy),
         ]:
-            tk.Button(frame, text=txt, command=cmd, font=FONT_SMALL, fg=fg, bg=bg,
-                      activeforeground=fg, activebackground=BG_DARK,
+            tk.Button(frame, text=txt, command=cmd, font=FONT_SMALL,
+                      fg="black", bg="white",
+                      activeforeground="black", activebackground="#d0d0d0",
                       relief=tk.FLAT, padx=6, pady=4, anchor=tk.W,
                       ).pack(fill=tk.X, pady=2)
- 
+
         tk.Frame(frame, bg=ACCENT, height=2).pack(fill=tk.X, pady=(8, 5))
         tk.Button(frame, text="EXPORT NumPy Arrays & Annotated Image",
                   command=self._export,
                   font=("Helvetica", 11, "bold"),
-                  fg="#0a0a0a", bg=ACCENT,
+                  fg="#ffffff", bg=ACCENT,
                   activeforeground="#ffffff", activebackground="#c73652",
                   relief=tk.FLAT, padx=6, pady=8,
                   ).pack(fill=tk.X)
@@ -3168,7 +3321,7 @@ class Annotator(tk.Tk):
                     "No georeferencing",
                     "Layers require a georeferenced source (GeoTIFF or GPKG).")
             return
- 
+
         lcfg = getattr(self._cfg.layers, name)
         wcrs = self._working_crs
  
@@ -3187,7 +3340,7 @@ class Annotator(tk.Tk):
                              ("All", "*.*")]
                 title = f"Load / Change {name} file"
 
-            path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+            path = _pick_file_macos(title, filetypes, tk_root=self)
             if path:
                 lcfg.path = path
             elif reload:
@@ -3205,24 +3358,32 @@ class Annotator(tk.Tk):
             print(f"\n[Layer: {name}]  file = {lcfg.path}")
 
             if name == "elevation":
-                img = _render_elevation_layer(lcfg, bounds, CANVAS_SIZE, # modification to map
+                img = _render_elevation_layer(lcfg, bounds, self._canvas_px,
                                                working_crs=wcrs)
             else:
-                img = _render_vector_layer(lcfg, bounds, CANVAS_SIZE,
+                img = _render_vector_layer(lcfg, bounds, self._canvas_px,
                                             layer_name=name,
                                             working_crs=wcrs)
  
             if img is not None:
+                alpha_val = self._layer_alpha_vars[name].get() / 100.0
+                vis_val   = self._layer_vis_vars[name].get()
                 self._renderer.set_layer(name, img)
-                self._renderer.set_layer_alpha(
-                    name, self._layer_alpha_vars[name].get() / 100.0)
-                self._renderer.set_layer_visible(
-                    name, self._layer_vis_vars[name].get())
+                self._renderer.set_layer_alpha(name, alpha_val)
+                self._renderer.set_layer_visible(name, vis_val)
                 short = Path(lcfg.path).name
                 self._layer_status[name].set(f"✓ {short[:14]}")
+                import numpy as _np
+                _arr = _np.array(img)
                 print(f"  [layer:{name}] ✓ Loaded  →  {Path(lcfg.path).name}")
+                print(f"    img size={img.size}  orig_size={self._renderer._orig_size}"
+                      f"  alpha={alpha_val:.2f}  visible={vis_val}")
+                print(f"    img alpha: min={_arr[:,:,3].min()}  max={_arr[:,:,3].max()}"
+                      f"  nonzero={(_arr[:,:,3]>0).sum()}")
+                print(f"    bounds used: {bounds}")
             else:
                 self._layer_status[name].set("No data")
+                print(f"  [layer:{name}] render returned None — check console above")
  
         except Exception as exc:
             self._layer_status[name].set("✗ Error")
@@ -3237,54 +3398,44 @@ class Annotator(tk.Tk):
     # =========================================================================
  
     def _auto_annotate_habitat(self):
+        threshold = getattr(self._cfg.ui, "auto_hab_threshold", AUTO_HAB_THRESHOLD)
         count = 0
         for row in range(self._N):
             for col in range(self._N):
                 if self._grid.labels[row, col] != CLASS_NONE:
                     continue
                 pix = self._renderer.cell_pixels(row, col)
-                non_black = (pix[:, :, :3].astype(np.int32).max(axis=2) > 20)
-                if non_black.sum() / non_black.size > AUTO_HAB_THRESHOLD:
+                non_black = (pix[:, :, :3].astype(np.int32).max(axis=2) > AUTO_LABEL_THRESHOLD)
+                if non_black.sum() / non_black.size > threshold:
                     self._grid.set_cell(row, col, CLASS_HAB)
                     count += 1
         self._refresh()
         messagebox.showinfo(
             "Auto-annotation complete",
             f"{count} cell(s) automatically labelled as Habitat "
-            f"(>{AUTO_HAB_THRESHOLD*100:.0f} % non-black pixels).")
+            f"(>{threshold*100:.0f} % non-black pixels).")
 
     def _auto_annotate_nohabitat(self):
-        """
-        Automatically label cells as Non Restorable Habitat when more than AUTO_HAB_THRESHOLD
-        (default 95 %) of their pixels are black in the background image.
-
-        Uses the full-resolution background stored in GridRenderer._bg_orig. AUTO_LABEL_THRESHOLD = 50
-        Black pixels are defined as RGB < (AUTO_LABEL_THRESHOLD, AUTO_LABEL_THRESHOLD, AUTO_LABEL_THRESHOLD) – i.e. very dark pixels
-        used as nodata / background in GPKG renders and some TIF files.
-
-        Only cells currently labeled CLASS_NONE are affected.
-        """
+        """Label cells as Non-Restorable when >threshold fraction of their pixels
+        are black/nodata.  Black is defined as max(R,G,B) < AUTO_LABEL_THRESHOLD."""
+        threshold = getattr(self._cfg.ui, "auto_hab_threshold", AUTO_HAB_THRESHOLD)
         N = self._N
         count = 0
-
         for row in range(N):
             for col in range(N):
                 if self._grid.labels[row, col] != CLASS_NONE:
-                    continue  # don't overwrite existing annotations
-                pixels = self._renderer.cell_pixels(row, col)  # H×W×4 uint8
-                rgb = pixels[:, :, :3].astype(np.int32)
-                # Non-black = at least one channel > threshold
-                non_black = (rgb.max(axis=2) < AUTO_LABEL_THRESHOLD)
-                frac = float(non_black.sum()) / non_black.size
-                if frac > AUTO_HAB_THRESHOLD:
+                    continue
+                pixels = self._renderer.cell_pixels(row, col)
+                rgb    = pixels[:, :, :3].astype(np.int32)
+                black  = (rgb.max(axis=2) < AUTO_LABEL_THRESHOLD)
+                if float(black.sum()) / black.size > threshold:
                     self._grid.set_cell(row, col, CLASS_NR)
                     count += 1
-
         self._refresh()
         messagebox.showinfo(
             "Auto-annotation complete",
             f"{count} cell(s) automatically labelled as Non Restorable Area\n"
-            f"(threshold: {AUTO_HAB_THRESHOLD * 100:.0f} % black pixels).",
+            f"(>{threshold * 100:.0f} % black pixels).",
         )
 
 
@@ -3437,18 +3588,36 @@ class Annotator(tk.Tk):
     # =========================================================================
     # SESSION
     # =========================================================================
- 
+
+    def _make_georef(self) -> Optional[dict]:
+        """Return spatial metadata dict for embedding in the session JSON."""
+        sq = self._renderer.sq_bounds_3857
+        if sq is None:
+            return None
+        d: dict = {
+            "sq_bounds":   list(sq),
+            "working_crs": self._working_crs,
+        }
+        if self._renderer.sq_bounds_4326 is not None:
+            d["sq_bounds_4326"] = list(self._renderer.sq_bounds_4326)
+        if self._image_path:
+            d["source_file"] = str(Path(self._image_path).resolve())
+        return d
+
     def _save_session(self):
-        path = filedialog.asksaveasfilename(
-            title="Save session", defaultextension=".json",
-            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        path = _pick_file_macos("Save session",
+                                filetypes=[("JSON", "*.json"), ("All", "*.*")],
+                                save=True, defaultextension=".json",
+                                initialfile="session.json",
+                                tk_root=self)
         if path:
-            self._grid.save_json(path)
+            self._grid.save_json(path, georef=self._make_georef())
             messagebox.showinfo("Saved", f"Session saved to:\n{path}")
- 
+
     def _load_session(self):
-        path = filedialog.askopenfilename(
-            title="Load session", filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        path = _pick_file_macos("Load session",
+                                filetypes=[("JSON", "*.json"), ("All", "*.*")],
+                                tk_root=self)
         if not path: return
         try:
             g = AnnotationGrid.load_json(path)
@@ -3480,7 +3649,7 @@ class Annotator(tk.Tk):
         stem = Path(self._source_label).stem
         path = os.path.join(folder, f"{stem}_session_N{self._N}.json")
         try:
-            self._grid.save_json(path)
+            self._grid.save_json(path, georef=self._make_georef())
             print(f"  [Exit] Session auto-saved → {path}")
         except Exception as exc:
             print(f"  [Exit] Warning: could not save session: {exc}")
@@ -3509,12 +3678,19 @@ class Annotator(tk.Tk):
         self._hide_inline_entry(False)
         self._N    = new_n
         self._grid = AnnotationGrid(new_n)
+        old = self._renderer
         self._renderer = GridRenderer(
             self._bg_img, new_n,
-            canvas_size=CANVAS_SIZE,
-            sq_bounds_3857=self._renderer.sq_bounds_3857,
-            sq_bounds_4326=self._renderer.sq_bounds_4326,
+            canvas_size=self._canvas_px,
+            sq_bounds_3857=old.sq_bounds_3857,
+            sq_bounds_4326=old.sq_bounds_4326,
         )
+        # Restore loaded layers — images are at _orig_size so no re-render needed
+        for name in LAYER_NAMES:
+            if old._layer_imgs.get(name) is not None:
+                self._renderer.set_layer(name, old._layer_imgs[name])
+            self._renderer.set_layer_alpha(name, old._layer_alpha[name])
+            self._renderer.set_layer_visible(name, old._layer_visible[name])
         self._sel_row = self._sel_col = None
         self._title_var.set(
             f"{self._source_label}  —  {self._N}×{self._N} grid")
@@ -3566,7 +3742,7 @@ class Annotator(tk.Tk):
                 f"{counts[CLASS_NONE]} cell(s) not annotated.\n\nExport anyway?"):
                 return
  
-        folder = filedialog.askdirectory(title="Choose output folder", initialdir = "./output")
+        folder = _pick_file_macos("Choose output folder", filetypes=[], directory=True, tk_root=self)
         if not folder: return
  
         stem  = Path(self._source_label).stem
@@ -3578,7 +3754,7 @@ class Annotator(tk.Tk):
             saved.append(fname)
  
         json_path = os.path.join(folder, f"{stem}_session_N{self._N}.json")
-        self._grid.save_json(json_path)
+        self._grid.save_json(json_path, georef=self._make_georef())
  
         # Annotated image
         try:
@@ -3593,7 +3769,8 @@ class Annotator(tk.Tk):
         gpkg_out = None
         if self._source_gdf is not None:
             try:
-                out_gdf  = _map_grid_to_gdf(self._grid, self._source_gdf)
+                out_gdf  = _map_grid_to_gdf(self._grid, self._source_gdf,
+                                              sq_bounds=self._renderer.sq_bounds_3857)
                 gpkg_out = os.path.join(folder,
                                          f"{stem}_annotated_N{self._N}.gpkg")
                 out_gdf.to_file(gpkg_out, driver="GPKG")
@@ -3647,6 +3824,8 @@ class Annotator(tk.Tk):
 # =============================================================================
  
 def _pick_layer_dialog(gpkg_path: str) -> Optional[str]:
+    if Path(gpkg_path).suffix.lower() not in _VECTOR_EXTS:
+        return None
     try:
         import geopandas as gpd
     except ImportError:
@@ -3675,30 +3854,50 @@ def _pick_layer_dialog(gpkg_path: str) -> Optional[str]:
  
  
 def _map_grid_to_gdf(grid: AnnotationGrid,
-                      gdf: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame":
+                      gdf: "gpd.GeoDataFrame",
+                      sq_bounds: Optional[Tuple] = None) -> "gpd.GeoDataFrame":
+    """Map annotation grid labels back onto the source GeoDataFrame features.
+
+    sq_bounds : (minx, miny, maxx, maxy) square extent used when the background
+        image was created (i.e. make_square_bounds(gdf.total_bounds)).  When
+        provided this is used as the grid origin so the cell-to-feature mapping
+        matches what the user saw in the interface.  Falls back to
+        make_square_bounds(gdf.total_bounds) when None.
+    """
     from shapely.geometry import box as sbox
     out = gdf.copy()
-    minx, miny, maxx, maxy = gdf.total_bounds
-    span = max(maxx - minx, maxy - miny, 1e-9)
-    N = grid.N; cs = span / N
-    classes = np.full(len(gdf), CLASS_NONE, dtype=int)
+
+    if sq_bounds is not None:
+        sq_minx, sq_miny, sq_maxx, sq_maxy = sq_bounds
+        span = sq_maxx - sq_minx  # already square
+    else:
+        raw_minx, raw_miny, raw_maxx, raw_maxy = gdf.total_bounds
+        span = max(raw_maxx - raw_minx, raw_maxy - raw_miny, 1e-9)
+        sq_minx = (raw_minx + raw_maxx) / 2 - span / 2
+        sq_miny = (raw_miny + raw_maxy) / 2 - span / 2
+
+    N  = grid.N
+    cs = span / N
+    classes   = np.full(len(gdf), CLASS_NONE, dtype=int)
     costs_out = np.zeros(len(gdf), dtype=float)
- 
+
     for fi in range(len(gdf)):
         geom = gdf.geometry.iloc[fi]
         if geom is None or geom.is_empty:
             continue
         fx0, fy0, fx1, fy1 = geom.bounds
-        cl0 = max(0, int((fx0 - minx) / cs))
-        cl1 = min(N-1, int((fx1 - minx) / cs))
-        rl0 = max(0, int((miny + span - fy1) / cs))
-        rl1 = min(N-1, int((miny + span - fy0) / cs))
-        votes = {}; cra = 0.0
-        for r in range(rl0, rl1+1):
-            for c in range(cl0, cl1+1):
+        cl0 = max(0, int((fx0 - sq_minx) / cs))
+        cl1 = min(N-1, int((fx1 - sq_minx) / cs))
+        rl0 = max(0, int((sq_miny + span - fy1) / cs))
+        rl1 = min(N-1, int((sq_miny + span - fy0) / cs))
+        votes: dict = {}
+        cra = 0.0
+        for r in range(rl0, rl1 + 1):
+            for c in range(cl0, cl1 + 1):
                 if geom.intersects(sbox(
-                    minx+c*cs, miny+span-(r+1)*cs,
-                    minx+(c+1)*cs, miny+span-r*cs)):
+                    sq_minx + c * cs,       sq_miny + span - (r + 1) * cs,
+                    sq_minx + (c + 1) * cs, sq_miny + span - r * cs,
+                )):
                     cls = int(grid.labels[r, c])
                     votes[cls] = votes.get(cls, 0) + 1
                     if cls == CLASS_RA:
@@ -3707,7 +3906,7 @@ def _map_grid_to_gdf(grid: AnnotationGrid,
             best = max(votes, key=votes.get)
             classes[fi]   = best
             costs_out[fi] = cra if best == CLASS_RA else 0.0
- 
+
     out["class"]       = classes
     out["class_label"] = [CLASS_META[c]["label"] for c in classes]
     out["restorable"]  = (classes == CLASS_RA).astype(int)
@@ -4132,7 +4331,7 @@ def compute_accessibility_from_roads(
  
 def annotate(
     image_path:  Optional[str]           = None,
-    N:           int                      = 30,
+    N:           int                      = 500,
     ask_N:       bool                     = True,
     cfg:         Optional[AnnotatorConfig] = None,
     working_crs: str                      = CRS_WEB_MERCATOR,
@@ -4150,15 +4349,13 @@ def annotate(
                   ``"EPSG:3857"`` (default) or ``"EPSG:31985"`` (SIRGAS).
     """
     if image_path is None:
-        r = tk.Tk(); r.withdraw()
-        image_path = filedialog.askopenfilename(
-            title="Select an image",
+        image_path = _pick_file_macos(
+            "Select an image",
             filetypes=[("Images & vectors",
                         "*.tif *.tiff *.png *.jpg *.jpeg *.gpkg *.geojson"),
                        ("GeoTIFF", "*.tif *.tiff"),
                        ("Images",  "*.png *.jpg *.jpeg"),
                        ("All",     "*.*")])
-        r.destroy()
         if not image_path:
             print("No file selected."); return {}
  
@@ -4182,7 +4379,7 @@ def annotate(
 def annotate_gpkg(
     gpkg_path:   Optional[str]           = None,
     layer:       Optional[str]           = None,
-    N:           int                      = 30,
+    N:           int                      = 500,
     ask_N:       bool                     = True,
     cfg:         Optional[AnnotatorConfig] = None,
     working_crs: str                      = CRS_WEB_MERCATOR,
@@ -4206,13 +4403,11 @@ def annotate_gpkg(
         raise ImportError("pip install geopandas matplotlib")
  
     if gpkg_path is None:
-        r = tk.Tk(); r.withdraw()
-        gpkg_path = filedialog.askopenfilename(
-            title="Select GeoPackage",
+        gpkg_path = _pick_file_macos(
+            "Select GeoPackage",
             filetypes=[("GeoPackage", "*.gpkg"),
                        ("Vectors",    "*.gpkg *.shp *.geojson *.json"),
                        ("All",        "*.*")])
-        r.destroy()
         if not gpkg_path:
             print("No file selected."); return None
  
@@ -4257,16 +4452,26 @@ if _HAS_HYDRA:
         _run_from_config(cfg)
  
  
+_RASTER_EXTS  = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+_VECTOR_EXTS  = {".gpkg", ".shp", ".geojson", ".json"}
+
 def _run_from_config(cfg: AnnotatorConfig):
     """Launch annotation using a fully populated AnnotatorConfig."""
     d = cfg.data
-    if d.gpkg_path:
-        annotate_gpkg(gpkg_path=d.gpkg_path, layer=d.layer or None,
-                      N=d.N, ask_N=False, cfg=cfg)
-    elif d.image_path:
-        annotate(image_path=d.image_path, N=d.N, ask_N=False, cfg=cfg)
-    else:
-        annotate(N=d.N, ask_N=True, cfg=cfg)
+    # Determine which entry point to use based on the file extension, not which
+    # config key was set — a .tif path in gpkg_path is a user misconfiguration.
+    for raw_path in (d.gpkg_path, d.image_path):
+        if not raw_path:
+            continue
+        ext = Path(raw_path).suffix.lower()
+        if ext in _VECTOR_EXTS:
+            annotate_gpkg(gpkg_path=raw_path, layer=d.layer or None,
+                          N=d.N, ask_N=False, cfg=cfg)
+            return
+        if ext in _RASTER_EXTS or ext not in _VECTOR_EXTS:
+            annotate(image_path=raw_path, N=d.N, ask_N=False, cfg=cfg)
+            return
+    annotate(N=d.N, ask_N=True, cfg=cfg)
  
  
 def main():
@@ -4278,7 +4483,7 @@ def main():
     parser.add_argument("--image",  "-i", type=str, default=None)
     parser.add_argument("--gpkg",   "-g", type=str, default=None)
     parser.add_argument("--layer",  "-l", type=str, default=None)
-    parser.add_argument("--N",      "-n", type=int, default=30)
+    parser.add_argument("--N",      "-n", type=int, default=500)
     parser.add_argument(
         "--working-crs", "-c",
         type=str, default=CRS_WEB_MERCATOR,
