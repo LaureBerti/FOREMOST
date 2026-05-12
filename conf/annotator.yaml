@@ -45,11 +45,11 @@ cost:
 
 ui:
   canvas_size:        800
-  max_zoom:           16.0
+  max_zoom:           30.0
   pan_key_step:       40
   auto_hab_threshold: 0.95
   auto_label_threshold: 50
-  panel_width:        310
+  panel_width:        400
 
 output:
   folder: ""

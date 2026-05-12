@@ -235,11 +235,11 @@ class CostConfig:
 @dataclass
 class UIConfig:
     canvas_size:        int   = 800
-    max_zoom:           float = 16.0
+    max_zoom:           float = 30.0
     pan_key_step:       int   = 40
     auto_hab_threshold: float = 0.70
     auto_label_threshold: int = 50
-    panel_width:        int   = 310
+    panel_width:        int   = 400
  
 @dataclass
 class OutputConfig:
@@ -394,13 +394,13 @@ def _rgb_hex(cls: int) -> str:
  
 # Display constants (overridable via UIConfig)
 CANVAS_SIZE  = 800
-MAX_ZOOM     = 16.0
+MAX_ZOOM     = 30.0
 MIN_ZOOM     = 1.0
 ZOOM_STEP    = 1.5
 PAN_KEY_STEP = 40
 GRID_ALPHA   = 80
 SEL_WIDTH    = 3
-PANEL_WIDTH  = 310
+PANEL_WIDTH  = 400
 FONT_LABEL   = ("Helvetica", 11)
 FONT_TITLE   = ("Helvetica", 13, "bold")
 FONT_SMALL   = ("Helvetica",  9)
@@ -781,8 +781,8 @@ def transform_bounds_to_sirgas(
 
     >>> # Use result to load a local GeoTIFF clipped to SIRGAS extent
     >>> sq_sirgas = make_square_bounds(*sirgas2)
-    >>> img, _, _, _ = _load_tiff_with_meta("dem.tif", size=800,
-    ...                                      working_crs="EPSG:31985")
+    >>> img, _, _, _, _ = _load_tiff_with_meta("dem.tif", size=800,
+    ...                                       working_crs="EPSG:31985")
     """
     if from_crs.upper() in (CRS_SIRGAS_UTM25S, "EPSG:31985"):
         return bounds   # already in target CRS — no transform needed
@@ -939,7 +939,8 @@ def _render_matplotlib_to_pil(
 LoadResult = Tuple[Image.Image,
                    Optional[Tuple[float,float,float,float]],
                    Optional[Tuple[float,float,float,float]],
-                   Optional["gpd.GeoDataFrame"]]
+                   Optional["gpd.GeoDataFrame"],
+                   Optional[np.ndarray]]   # H×W int8 class array when raster is categorical
  
  
 def _load_tiff_with_meta(
@@ -967,22 +968,27 @@ def _load_tiff_with_meta(
 
     Returns
     -------
-    (pil_image, sq_bounds_working, sq_bounds_4326, None)
+    (pil_image, sq_bounds_working, sq_bounds_4326, None, class_arr)
         - ``pil_image``        : RGBA thumbnail, *size* × *size* px
         - ``sq_bounds_working``: square bbox in *working_crs* (or None if
                                  the file has no georeference)
         - ``sq_bounds_4326``   : same extent in WGS84 lon/lat (or None)
         - Fourth element       : always None for raster files (reserved for
                                  the GeoDataFrame returned by GPKG loaders)
+        - ``class_arr``        : H×W int8 array with values 1/2/3/0 when
+                                 the raster is categorical (≤15 integer classes
+                                 matching FOREMOST class IDs); None otherwise
     """
     sq_working = sq4 = None
     try:
         import rasterio
         from rasterio.warp import transform_bounds
- 
+
+        class_arr: Optional[np.ndarray] = None
+
         with rasterio.open(path) as ds:
             nb, nodata = ds.count, ds.nodata
- 
+
             def _norm(b):
                 arr = ds.read(b).astype(np.float64)
                 if nodata is not None:
@@ -993,14 +999,55 @@ def _load_tiff_with_meta(
                 return np.nan_to_num(
                     np.clip((arr - lo) / (hi - lo) * 255, 0, 255), nan=0
                 ).astype(np.uint8)
- 
+
             if nb >= 3:
                 r, g, b = _norm(1), _norm(2), _norm(3)
             elif nb == 2:
                 r, g = _norm(1), _norm(2); b = r
             else:
-                r = _norm(1); g = b = r
- 
+                # Single-band: check if categorical (≤15 integer-valued classes)
+                arr_raw = ds.read(1).astype(np.float64)
+                if nodata is not None:
+                    arr_raw = np.where(arr_raw == nodata, np.nan, arr_raw)
+                valid = arr_raw[~np.isnan(arr_raw)]
+                unique_vals = np.unique(valid)
+                is_categorical = (
+                    len(unique_vals) <= 15 and
+                    len(unique_vals) > 0 and
+                    np.all(np.abs(unique_vals - np.round(unique_vals)) < 1e-6)
+                )
+                if is_categorical:
+                    # Map FOREMOST class IDs to their display colors
+                    _CLASS_RGB = {
+                        CLASS_HAB: (45, 106, 79),
+                        CLASS_RA:  (244, 162, 97),
+                        CLASS_NR:  (141, 153, 174),
+                    }
+                    h, w = arr_raw.shape
+                    rgb_cat = np.zeros((h, w, 3), dtype=np.uint8)
+                    class_int = np.zeros((h, w), dtype=np.int8)
+                    for val, color in _CLASS_RGB.items():
+                        mask = np.abs(arr_raw - val) < 0.5
+                        rgb_cat[mask] = color
+                        class_int[mask] = val
+                    r, g, b = rgb_cat[:, :, 0], rgb_cat[:, :, 1], rgb_cat[:, :, 2]
+                    # Pad class_int to the same square that _square_pad_resize produces,
+                    # so class_arr[row, col] aligns with the grid cell coordinate system.
+                    sq = max(h, w)
+                    class_int_sq = np.zeros((sq, sq), dtype=np.int8)
+                    row_off = (sq - h) // 2
+                    col_off = (sq - w) // 2
+                    class_int_sq[row_off:row_off + h, col_off:col_off + w] = class_int
+                    class_arr = class_int_sq
+                    print(f"  [tiff] Categorical raster detected — "
+                          f"classes: {[int(v) for v in unique_vals]}")
+                    for val in unique_vals:
+                        cnt = int(np.sum(np.abs(arr_raw - val) < 0.5))
+                        label = CLASS_META.get(int(val), {}).get("label", f"class {int(val)}")
+                        print(f"    class {int(val):2d} ({label}): {cnt:,} pixels")
+                else:
+                    r = _norm(1); g = b = r
+
             # Extract bounds in the requested working CRS
             try:
                 raw = ds.bounds
@@ -1034,10 +1081,10 @@ def _load_tiff_with_meta(
                 print(f"  [tiff] CRS: {native_crs} → working CRS: {working_crs}")
             except Exception as exc:
                 print(f"  [tiff] Bounds extraction failed: {exc}")
- 
+
         rgb = np.stack([r, g, b], axis=-1)
         return _square_pad_resize(Image.fromarray(rgb, "RGB"), size), \
-               sq_working, sq4, None
+               sq_working, sq4, None, class_arr
 
     except ImportError:
         pass
@@ -1047,7 +1094,7 @@ def _load_tiff_with_meta(
     img = Image.open(path)
     if img.mode not in ("RGB", "RGBA", "L"):
         img = img.convert("RGB")
-    return _square_pad_resize(img, size), None, None, None
+    return _square_pad_resize(img, size), None, None, None, None
  
  
 def _load_gpkg_with_meta(
@@ -1146,7 +1193,7 @@ def _load_gpkg_with_meta(
                     pass
  
     img = _render_matplotlib_to_pil(_plot, sq_working, size, bg_color="#1a1a2e")
-    return img, sq_working, sq4, gdf
+    return img, sq_working, sq4, gdf, None
  
  
 def _load_source_with_meta(
@@ -1175,7 +1222,7 @@ def _load_source_with_meta(
         img = Image.open(source)
         if img.mode not in ("RGB", "RGBA"):
             img = img.convert("RGB")
-        return _square_crop_resize(img, size), None, None, None
+        return _square_crop_resize(img, size), None, None, None, None
  
  
 # =============================================================================
@@ -2634,7 +2681,7 @@ class Annotator(tk.Tk):
         self._grid         = AnnotationGrid(N)
         self._sel_row      = None
         self._sel_col      = None
-        self._cur_class    = tk.IntVar(value=CLASS_HAB)
+        self._cur_class    = tk.IntVar(value=CLASS_NONE)  # no class pre-selected
         self._tk_img       = None
         self._canvas_img_id = None
         self._inline_entry = self._inline_entry_row = self._inline_entry_col = None
@@ -2643,12 +2690,13 @@ class Annotator(tk.Tk):
         self._drag_last_cell: Optional[Tuple[int,int]] = None
         self.result_arrays = None
         self.result_gdf    = None
- 
+        self._raster_class_arr: Optional[np.ndarray] = None  # H×W int8 when pre-classified
+
         # Default cost
         self._default_cost_var = tk.DoubleVar(value=self._cfg.cost.default_cost)
         self._tree_cost_var    = tk.DoubleVar(value=self._cfg.cost.tree_unit_cost)
         self._cell_size_var    = tk.DoubleVar(value=self._cfg.cost.cell_size_m)
- 
+
         # Layer vars (checkbox + alpha scale per layer)
         self._layer_vis_vars:   Dict[str, tk.BooleanVar] = {}
         self._layer_alpha_vars: Dict[str, tk.DoubleVar]  = {}
@@ -2658,16 +2706,18 @@ class Annotator(tk.Tk):
             self._layer_vis_vars[name]   = tk.BooleanVar(value=lcfg.enabled)
             self._layer_alpha_vars[name] = tk.DoubleVar(value=lcfg.alpha * 100)
             self._layer_status[name]     = tk.StringVar(value="Not loaded")
- 
+
         # Load background
         if pil_image is not None:
             bg = pil_image
         elif image_path is not None:
             print(f"Loading {image_path} (working CRS: {working_crs}) …")
-            bg, sq_w, sq4, gdf = _load_source_with_meta(
+            bg, sq_w, sq4, gdf, class_arr = _load_source_with_meta(
                 image_path, layer, self._canvas_px, working_crs=working_crs)
             if gdf is not None and source_gdf is None:
                 self._source_gdf = gdf
+            if class_arr is not None:
+                self._raster_class_arr = class_arr
             if sq_bounds_3857 is None:
                 sq_bounds_3857 = sq_w   # generic name reused for any working CRS
             if sq_bounds_4326 is None:
@@ -2725,11 +2775,12 @@ class Annotator(tk.Tk):
         # ── Scrollable right panel ────────────────────────────────────────────
         # Wrap all control panels in a Canvas+Scrollbar so they are always
         # reachable on small / laptop screens.
-        right_outer = tk.Frame(self, bg=BG_DARK, width=PANEL_WIDTH)
+        _pw = getattr(self._cfg.ui, "panel_width", PANEL_WIDTH)
+        right_outer = tk.Frame(self, bg=BG_DARK, width=_pw)
         right_outer.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=10)
         right_outer.pack_propagate(False)
 
-        _inner_w = PANEL_WIDTH - 16          # leave room for scrollbar
+        _inner_w = _pw - 16          # leave room for scrollbar
         right_scroll_canvas = tk.Canvas(
             right_outer, bg=BG_DARK, highlightthickness=0, width=_inner_w)
         right_sb = tk.Scrollbar(
@@ -2774,7 +2825,11 @@ class Annotator(tk.Tk):
  
     # ── zoom bar ──────────────────────────────────────────────────────────────
  
+    # Fixed zoom levels shown in the preset dropdown (percent values)
+    _ZOOM_PRESETS = [25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000]
+
     def _build_zoom_bar(self, parent):
+        import tkinter.ttk as ttk
         bar = tk.Frame(parent, bg=BG_MID)
         bar.pack(fill=tk.X, pady=(0, 4))
         btn = dict(font=FONT_SMALL, relief=tk.RAISED, padx=8, pady=3,
@@ -2784,8 +2839,14 @@ class Annotator(tk.Tk):
             side=tk.LEFT, padx=(4, 0))
         tk.Button(bar, text="+", command=self._do_zoom_in, **btn).pack(
             side=tk.LEFT, padx=2)
-        tk.Button(bar, text="⊡  1:1", command=self._do_zoom_reset, **btn).pack(
-            side=tk.LEFT, padx=2)
+        # Zoom preset dropdown
+        preset_labels = [f"{p} %" for p in self._ZOOM_PRESETS]
+        self._zoom_combo_var = tk.StringVar(value="100 %")
+        combo = ttk.Combobox(bar, textvariable=self._zoom_combo_var,
+                             values=preset_labels, width=7,
+                             state="readonly", font=FONT_SMALL)
+        combo.pack(side=tk.LEFT, padx=2)
+        combo.bind("<<ComboboxSelected>>", lambda e: self._set_zoom_preset())
         self._zoom_var = tk.StringVar(value="Zoom: 100 %")
         tk.Label(bar, textvariable=self._zoom_var, font=FONT_SMALL,
                  fg=ACCENT, bg=BG_MID, width=12, anchor=tk.E).pack(
@@ -2840,30 +2901,34 @@ class Annotator(tk.Tk):
                   activeforeground="#cc0000", activebackground="#f0d0d0",
                   relief=tk.FLAT, padx=5, pady=3,
                   command=self._clear_selected).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        # Auto-annotate button (requires GPKG or image background)
-        tk.Button(
-            frame, text="🤖 Auto-label Habitat from image",
-            font=FONT_SMALL, fg="black", bg="white",
-            activeforeground="black", activebackground="#d0d0d0",
-            relief=tk.FLAT, padx=6, pady=4,
-            command=self._auto_annotate_habitat,
-        ).pack(fill=tk.X, pady=(4, 0))
-
-        tk.Button(
-            frame, text="🤖 Auto-label Non Restorable area from image",
-            font=FONT_SMALL, fg="black", bg="white",
-            activeforeground="black", activebackground="#d0d0d0",
-            relief=tk.FLAT, padx=6, pady=4,
-            command=self._auto_annotate_nohabitat,
-        ).pack(fill=tk.X, pady=(4, 0))
-
-        tk.Button(
-            frame, text="🤖 Auto-label remaining cells as Restorable",
-            font=FONT_SMALL, fg="black", bg="white",
-            activeforeground="black", activebackground="#d0d0d0",
-            relief=tk.FLAT, padx=6, pady=4,
-            command=self._auto_annotate_restorable,
-        ).pack(fill=tk.X, pady=(4, 0))
+        # Auto-annotate buttons — 2-column grid layout
+        ag = tk.Frame(frame, bg=BG_DARK)
+        ag.pack(fill=tk.X, pady=(4, 0))
+        ag.columnconfigure(0, weight=1)
+        ag.columnconfigure(1, weight=1)
+        _abtn = dict(font=FONT_SMALL, fg="black", bg="white",
+                     activeforeground="black", activebackground="#d0d0d0",
+                     relief=tk.FLAT, padx=3, pady=3)
+        tk.Button(ag, text="🤖 Habitat Auto-label",
+                  command=self._auto_annotate_habitat, **_abtn,
+                  ).grid(row=0, column=0, sticky="ew", padx=(0,1), pady=1)
+        tk.Button(ag, text="🤖 Non-Restorable Auto-label",
+                  command=self._auto_annotate_nohabitat, **_abtn,
+                  ).grid(row=0, column=1, sticky="ew", padx=(1,0), pady=1)
+        tk.Button(ag, text="🤖 Restorable Auto-label",
+                  command=self._auto_annotate_restorable, **_abtn,
+                  ).grid(row=1, column=0, sticky="ew", padx=(0,1), pady=1)
+        _has_raster = self._raster_class_arr is not None
+        tk.Button(ag, text="🗺️ Raster Auto-label",
+                  command=self._auto_label_from_raster,
+                  font=FONT_SMALL,
+                  fg="black",
+                  bg="#2d6a4f" if _has_raster else BG_MID,
+                  activeforeground="black",
+                  activebackground="#1b4332" if _has_raster else BG_MID,
+                  relief=tk.FLAT, padx=3, pady=3,
+                  state=tk.NORMAL if _has_raster else tk.DISABLED,
+                  ).grid(row=1, column=1, sticky="ew", padx=(1,0), pady=1)
 
     # ── layer control panel ───────────────────────────────────────────────────
  
@@ -3028,31 +3093,40 @@ class Annotator(tk.Tk):
     def _build_action_panel(self, parent):
         frame = tk.Frame(parent, bg=BG_DARK)
         frame.pack(fill=tk.X, padx=6, pady=(8, 4))
- 
-        for txt, cmd in [
-            #("↩  Undo  [Ctrl+Z]",    self._undo),
-            ("💾  Save session",       self._save_session),
-            ("📂  Load session",       self._load_session),
-            ("🗑  Clear all",           self._clear_all),
-            ("✖  Exit",                self.destroy),
-        ]:
-            tk.Button(frame, text=txt, command=cmd, font=FONT_SMALL,
-                      fg="black", bg="white",
-                      activeforeground="black", activebackground="#d0d0d0",
-                      relief=tk.FLAT, padx=6, pady=4, anchor=tk.W,
-                      ).pack(fill=tk.X, pady=2)
 
-        tk.Frame(frame, bg=ACCENT, height=2).pack(fill=tk.X, pady=(8, 5))
-        tk.Button(frame, text="EXPORT NumPy Arrays & Annotated Image",
-                  command=self._export,
-                  font=("Helvetica", 11, "bold"),
-                  fg="#ffffff", bg=ACCENT,
-                  activeforeground="#ffffff", activebackground="#c73652",
-                  relief=tk.FLAT, padx=6, pady=8,
-                  ).pack(fill=tk.X)
-        tk.Label(frame, text="[Ctrl+S]", font=FONT_SMALL,
-                 fg=FG_DIM, bg=BG_DARK).pack(anchor=tk.E)
- 
+        # 2-column grid: Save | Load / Clear | Export
+        btn_grid = tk.Frame(frame, bg=BG_DARK)
+        btn_grid.pack(fill=tk.X, pady=(0, 2))
+        btn_grid.columnconfigure(0, weight=1)
+        btn_grid.columnconfigure(1, weight=1)
+        for (txt, cmd, kw), (row, col) in zip(
+            [("💾 Save session", self._save_session,
+              dict(fg="black", bg="white", activeforeground="black",
+                   activebackground="#d0d0d0", font=FONT_SMALL,
+                   relief=tk.FLAT, padx=4, pady=4, anchor=tk.W)),
+             ("📂 Load session", self._load_session,
+              dict(fg="black", bg="white", activeforeground="black",
+                   activebackground="#d0d0d0", font=FONT_SMALL,
+                   relief=tk.FLAT, padx=4, pady=4, anchor=tk.W)),
+             ("🗑 Clear all",    self._clear_all,
+              dict(fg="black", bg="white", activeforeground="black",
+                   activebackground="#d0d0d0", font=FONT_SMALL,
+                   relief=tk.FLAT, padx=4, pady=4, anchor=tk.W)),
+             ("EXPORT Arrays & Image", self._export,
+              dict(fg="black", bg=ACCENT, activeforeground="black",
+                   activebackground="#c73652",
+                   font=("Helvetica", 10, "bold"),
+                   relief=tk.FLAT, padx=4, pady=4, anchor=tk.CENTER))],
+            [(0,0),(0,1),(1,0),(1,1)]
+        ):
+            tk.Button(btn_grid, text=txt, command=cmd, **kw,
+                      ).grid(row=row, column=col, sticky="ew", padx=2, pady=2)
+        tk.Button(frame, text="✖  Exit", command=self.destroy,
+                  font=FONT_SMALL, fg="black", bg="white",
+                  activeforeground="black", activebackground="#d0d0d0",
+                  relief=tk.FLAT, padx=6, pady=5, anchor=tk.W,
+                  ).pack(fill=tk.X, pady=(4, 2))
+
     # =========================================================================
     # KEY & MOUSE BINDINGS
     # =========================================================================
@@ -3100,6 +3174,19 @@ class Annotator(tk.Tk):
     def _do_zoom_in(self):  self._renderer.zoom_in();  self._post_zoom()
     def _do_zoom_out(self): self._renderer.zoom_out(); self._post_zoom()
     def _do_zoom_reset(self): self._renderer.reset_zoom(); self._post_zoom()
+
+    def _set_zoom_preset(self):
+        """Apply the zoom level chosen from the preset dropdown."""
+        try:
+            pct = int(self._zoom_combo_var.get().rstrip(" %"))
+        except ValueError:
+            return
+        factor = pct / 100.0
+        factor = max(MIN_ZOOM, min(MAX_ZOOM, factor))
+        self._renderer._zoom = factor
+        self._renderer._pan_x = 0.0
+        self._renderer._pan_y = 0.0
+        self._post_zoom()
  
     def _on_mousewheel(self, event):
         self._renderer.zoom_at(
@@ -3107,7 +3194,12 @@ class Annotator(tk.Tk):
         self._post_zoom()
  
     def _post_zoom(self):
-        self._zoom_var.set(f"Zoom: {self._renderer.zoom_pct} %")
+        pct = self._renderer.zoom_pct
+        self._zoom_var.set(f"Zoom: {pct} %")
+        # Snap combo to nearest preset label if exact match, else show freeform
+        lbl = f"{pct} %"
+        vals = [f"{p} %" for p in self._ZOOM_PRESETS]
+        self._zoom_combo_var.set(lbl if lbl in vals else f"{pct} %")
         if self._inline_entry is not None:
             self._reposition_inline_entry(
                 self._inline_entry_row, self._inline_entry_col)
@@ -3153,7 +3245,8 @@ class Annotator(tk.Tk):
         row, col = self._renderer.cell_at(event.x, event.y)
         self._drag_last_cell = (row, col)
         self._select_cell(row, col)
-        self._annotate_cell(row, col)
+        if self._cur_class.get() != CLASS_NONE:
+            self._annotate_cell(row, col)
  
     def _on_canvas_release(self, event):
         if self._ctrl_pan_active:
@@ -3176,6 +3269,8 @@ class Annotator(tk.Tk):
             return
         self._drag_last_cell = (row, col)
         cls = self._cur_class.get()
+        if cls == CLASS_NONE:
+            return
         self._hide_inline_entry(validate=True)
         self._select_cell(row, col)
         existing = (self._grid.costs[row, col]
@@ -3186,6 +3281,8 @@ class Annotator(tk.Tk):
     def _on_class_change(self):
         if self._sel_row is not None:
             cls = self._cur_class.get()
+            if cls == CLASS_NONE:
+                return
             if cls == CLASS_RA:
                 self._grid.set_cell(self._sel_row, self._sel_col, CLASS_RA, 0.0)
                 self._refresh()
@@ -3455,6 +3552,57 @@ class Annotator(tk.Tk):
         messagebox.showinfo(
             "Auto-annotation complete",
             f"{count} remaining cell(s) automatically labelled as Restorable Area."
+        )
+
+    def _auto_label_from_raster(self):
+        """Assign N×N grid labels from the pre-classified raster via majority vote."""
+        arr = self._raster_class_arr
+        if arr is None:
+            messagebox.showwarning("No pre-classified raster",
+                                   "Load a pre-classified raster first.")
+            return
+        N   = self._N
+        h, w = arr.shape
+        # Compute N×N block majority class using reshape-mean trick:
+        # pad to exact multiples of N, split into N×N blocks, take mode.
+        ph = int(np.ceil(h / N) * N)
+        pw = int(np.ceil(w / N) * N)
+        padded = np.zeros((ph, pw), dtype=np.int8)
+        padded[:h, :w] = arr
+        blocks = padded.reshape(N, ph // N, N, pw // N)
+        # For each block, pick the most common non-zero class.
+        # Blocks with zero valid pixels (100 % nodata/ocean) are left as CLASS_NONE
+        # so the user can decide — they are NOT forced into CLASS_NR.
+        labels_out = np.zeros((N, N), dtype=np.int8)
+        for row in range(N):
+            for col in range(N):
+                blk = blocks[row, :, col, :].ravel()
+                blk = blk[blk > 0]   # 0 = nodata
+                if len(blk) == 0:
+                    labels_out[row, col] = CLASS_NONE  # entirely nodata → leave unclassified
+                    continue
+                unique, cnts = np.unique(blk, return_counts=True)
+                labels_out[row, col] = int(unique[cnts.argmax()])
+
+        # Apply to grid
+        counts_by_class: Dict[int, int] = {
+            CLASS_NONE: 0, CLASS_HAB: 0, CLASS_RA: 0, CLASS_NR: 0}
+        for row in range(N):
+            for col in range(N):
+                cls = int(labels_out[row, col])
+                if cls not in (CLASS_HAB, CLASS_RA, CLASS_NR):
+                    cls = CLASS_NONE
+                if cls != CLASS_NONE:
+                    self._grid.set_cell(row, col, cls)
+                counts_by_class[cls] = counts_by_class.get(cls, 0) + 1
+        self._refresh()
+        messagebox.showinfo(
+            "Auto-label complete",
+            f"Grid labelled from pre-classified raster ({N}\u00d7{N} cells):\n"
+            f"  Habitat        : {counts_by_class[CLASS_HAB]}\n"
+            f"  Restorable     : {counts_by_class[CLASS_RA]}\n"
+            f"  Non-Restorable : {counts_by_class[CLASS_NR]}\n"
+            f"  Unclassified   : {counts_by_class[CLASS_NONE]} (no-data blocks)"
         )
 
     # =========================================================================
@@ -3735,10 +3883,10 @@ class Annotator(tk.Tk):
                 print(f"[Export] Warning: road accessibility skipped — {exc}")
         # ─────────────────────────────────────────────────────────────────────
 
-        if coverage < 100.0:
+        if counts[CLASS_NONE] > 0:
             if not messagebox.askyesno(
                 "Incomplete export",
-                f"Coverage: {coverage:.1f} %\n"
+                f"Coverage: {coverage:.2f} %\n"
                 f"{counts[CLASS_NONE]} cell(s) not annotated.\n\nExport anyway?"):
                 return
  
@@ -3814,7 +3962,10 @@ class Annotator(tk.Tk):
         for cls, var in self._stat_vars.items():
             var.set(str(counts.get(cls, 0)))
         cov = self._grid.coverage()
-        self._cov_var.set(f"{cov:.1f} %")
+        not_ann = counts.get(CLASS_NONE, 0)
+        # Use enough decimals so 99.96 % never rounds to 100.0 % when cells remain
+        cov_str = f"{cov:.1f} %" if not_ann == 0 else f"{cov:.2f} %"
+        self._cov_var.set(cov_str)
         bw = int(self._cov_bar_frame.winfo_width() * cov / 100.0)
         self._cov_bar.place(x=0, y=0, height=5, width=max(0, bw))
  
@@ -4426,7 +4577,7 @@ def annotate_gpkg(
         if val: N = val
  
     print(f"Rasterising {gpkg_path} (layer: {layer}, CRS: {working_crs}) …")
-    pil_bg, sq_w, sq4, gdf = _load_gpkg_with_meta(
+    pil_bg, sq_w, sq4, gdf, _ = _load_gpkg_with_meta(
         gpkg_path, layer, CANVAS_SIZE, working_crs=working_crs)
  
     app = Annotator(
