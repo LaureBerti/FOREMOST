@@ -219,9 +219,9 @@ class DataConfig:
 class CostConfig:
     default_cost:           float = 100.0   # $ applied to CLASS_RA cells with no cost
     auto_fill:              bool  = True    # auto-fill on export if True
-    tree_unit_cost:         float = 30.0   # € per planted tree
-    tree_spacing_m:         float = 2.0    # metres between trees (planting density)
-    cell_size_m:            float = 100.0  # side length of one planning unit (m)
+    tree_unit_cost:         float = 15.0   # $ per planted tree
+    tree_spacing_m:         float = 2.5    # metres between trees (planting density, ~1600 trees/ha)
+    cell_size_m:            float = 100.0  # auto-computed from raster extent / N; 100 m fallback for synthetic mode
     inaccessible_surcharge: float = 0.40   # fractional cost increase for inaccessible cells
     elevation_base_m:       float = 0.0    # reference elevation (m)
     elevation_slope:        float = 0.005  # cost increase per metre above base
@@ -297,8 +297,10 @@ def write_default_yaml(config_dir: str = "conf") -> Path:
         linewidth: {cfg.layers.hydrology.linewidth}
  
     cost:
-      default_cost: {cfg.cost.default_cost}    # $ per cell applied to CLASS_RA cells with no cost
-      auto_fill:    {str(cfg.cost.auto_fill).lower()}   # fill missing costs automatically on export
+      default_cost:   {cfg.cost.default_cost}    # $ per cell applied to CLASS_RA cells with no cost
+      auto_fill:      {str(cfg.cost.auto_fill).lower()}   # fill missing costs automatically on export
+      tree_unit_cost: {cfg.cost.tree_unit_cost}  # $ per planted tree
+      tree_spacing_m: {cfg.cost.tree_spacing_m}  # metres between trees (2–3 m → 1200–1700 trees/ha)
  
     ui:
       canvas_size:        {cfg.ui.canvas_size}
@@ -463,6 +465,12 @@ class AnnotationGrid:
         """
         mask = (self.labels == CLASS_RA) & (self.costs == 0.0)
         self.costs[mask] = default
+        return int(mask.sum())
+
+    def clear_costs(self) -> int:
+        """Reset costs to 0 for all CLASS_RA cells. Returns number of cells cleared."""
+        mask = (self.labels == CLASS_RA) & (self.costs != 0.0)
+        self.costs[mask] = 0.0
         return int(mask.sum())
  
     def counts(self) -> dict:
@@ -2730,7 +2738,15 @@ class Annotator(tk.Tk):
         self._renderer = GridRenderer(bg, N, canvas_size=self._canvas_px,
                                        sq_bounds_3857=sq_bounds_3857,
                                        sq_bounds_4326=sq_bounds_4326)
- 
+
+        # Auto-compute cell_size_m from raster extent and N
+        if sq_bounds_3857 is not None:
+            extent_m = sq_bounds_3857[2] - sq_bounds_3857[0]   # square side length
+            computed = round(extent_m / N, 2)
+            self._cell_size_var.set(computed)
+            self._cfg.cost.cell_size_m = computed
+            print(f"[cell_size] extent={extent_m:,.0f} m  N={N}  → cell_size_m={computed:,.2f} m")
+
         # Pre-load layers if enabled in config
         for name in LAYER_NAMES:
             lcfg = getattr(self._cfg.layers, name)
@@ -3029,27 +3045,34 @@ class Annotator(tk.Tk):
                   activeforeground="black", activebackground="#d0d0d0",
                   relief=tk.FLAT, padx=5, pady=2,
                   command=self._apply_default_cost).pack(side=tk.LEFT)
+        tk.Button(row, text="🗑 Clear costs",
+                  font=FONT_SMALL, fg="black", bg="#f4a261",
+                  activeforeground="black", activebackground="#e76f51",
+                  relief=tk.FLAT, padx=5, pady=2,
+                  command=self._clear_costs).pack(side=tk.LEFT, padx=(4, 0))
  
         # model cost row
         row2 = tk.Frame(frame, bg=BG_DARK)
         row2.pack(fill=tk.X, padx=6, pady=(0, 4))
-        tk.Label(row2, text="€/tree:", font=FONT_SMALL,
+        tk.Label(row2, text="$/tree:", font=FONT_SMALL,
                  fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT)
         tk.Entry(row2, textvariable=self._tree_cost_var,
                  font=FONT_MONO, width=6, bg="white", fg="black",
                  insertbackground="black", relief=tk.FLAT, bd=3,
                  ).pack(side=tk.LEFT, padx=(2, 6))
-        tk.Label(row2, text="cell m:", font=FONT_SMALL,
+        tk.Label(row2, text="cell:", font=FONT_SMALL,
                  fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT)
-        tk.Entry(row2, textvariable=self._cell_size_var,
-                 font=FONT_MONO, width=7, bg="white", fg="black",
-                 insertbackground="black", relief=tk.FLAT, bd=3,
-                 ).pack(side=tk.LEFT, padx=(2, 6))
+        self._cell_size_label = tk.Label(row2, textvariable=self._cell_size_var,
+                 font=FONT_MONO, fg=FG_DIM, bg=BG_DARK)
+        self._cell_size_label.pack(side=tk.LEFT, padx=(2, 1))
+        tk.Label(row2, text="m  (auto)", font=FONT_SMALL,
+                 fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT, padx=(0, 6))
         tk.Button(row2, text="Fill model costs",
                   font=FONT_SMALL, fg="black", bg="white",
                   activeforeground="black", activebackground="#d0d0d0",
                   relief=tk.FLAT, padx=5, pady=2,
                   command=self._fill_computed_costs).pack(side=tk.LEFT)
+
  
     # ── statistics panel ──────────────────────────────────────────────────────
  
@@ -3623,12 +3646,19 @@ class Annotator(tk.Tk):
         self._refresh()
         messagebox.showinfo("Default cost applied",
                             f"{n} cell(s) updated with default cost = {default:g} $.")
- 
+
+    def _clear_costs(self):
+        """Reset all CLASS_RA cell costs to 0."""
+        n = self._grid.clear_costs()
+        self._refresh()
+        self._update_stats()
+        self._status(f"{n} cell cost(s) cleared.")
+
     def _fill_computed_costs(self):
         """Compute ecological restoration costs and fill all CLASS_RA cells.
 
         Formula:
-            cost = (cell_m2 / spacing_m2) x euro/tree
+            cost = (cell_m2 / spacing_m2) x $/tree
                    x elev_factor
                    x road_factor      (penalises distance to road network)
                    x water_factor     (penalises distance to water network)
@@ -3643,11 +3673,11 @@ class Annotator(tk.Tk):
             cell_size_m    = float(self._cell_size_var.get())
         except (ValueError, tk.TclError):
             messagebox.showwarning("Invalid parameters",
-                                   "\u20ac/tree and cell m must be positive numbers.")
+                                   "$/tree and cell m must be positive numbers.")
             return
         if tree_unit_cost <= 0 or cell_size_m <= 0:
             messagebox.showwarning("Invalid parameters",
-                                   "\u20ac/tree and cell m must be positive numbers.")
+                                   "$/tree and cell m must be positive numbers.")
             return
 
         cfg = self._cfg.cost
@@ -3688,7 +3718,7 @@ class Annotator(tk.Tk):
             print("[cost] No hydrology layer -> water penalty = 0")
 
         # cost model parameters
-        spacing_m           = getattr(cfg, "tree_spacing_m",        2.0)
+        spacing_m           = getattr(cfg, "tree_spacing_m",        2.5)
         elev_base_m         = getattr(cfg, "elevation_base_m",      0.0)
         elev_slope          = getattr(cfg, "elevation_slope",        0.005)
         road_penalty_slope  = getattr(cfg, "road_penalty_slope",    0.0002)
@@ -3716,20 +3746,33 @@ class Annotator(tk.Tk):
         n_updated = int(ra_mask.sum())
 
         self._refresh()
-        used = []
-        if elev_img is not None: used.append("elevation")
-        if road_path:            used.append("road dist")
-        if water_path:           used.append("water dist")
-        factors_str = ", ".join(used) if used else "none"
+
+        # Build per-factor status lines for the info popup
+        factor_lines = []
+        factor_lines.append(
+            f"  \u2713 base trees  ({n_trees:.0f} trees/cell \u00d7 ${tree_unit_cost:g}/tree)"
+        )
+        if elev_img is not None:
+            factor_lines.append("  \u2713 elevation   (loaded)")
+        else:
+            factor_lines.append("  \u2717 elevation   (not loaded \u2014 load elevation layer to include)")
+        if road_path:
+            factor_lines.append(f"  \u2713 road dist   ({road_path.split('/')[-1]})")
+        else:
+            factor_lines.append("  \u2717 road dist   (no road layer path set \u2014 load roads layer to include)")
+        if water_path:
+            factor_lines.append(f"  \u2713 water dist  ({water_path.split('/')[-1]})")
+        else:
+            factor_lines.append("  \u2717 water dist  (no hydrology layer path set \u2014 load hydrology to include)")
+
         if n_updated:
             mean_c = float(cost_grid[ra_mask].mean())
             messagebox.showinfo(
                 "Model costs applied",
-                f"{n_updated} cell(s) updated.\n"
-                f"\u20ac/tree={tree_unit_cost:g}  cell={cell_size_m:g} m\n"
-                f"n_trees/cell \u2248 {n_trees:.0f}\n"
-                f"Factors used: {factors_str}\n"
-                f"Mean cost: {mean_c:,.0f} \u20ac")
+                f"{n_updated} CLASS_RA cell(s) updated.\n"
+                f"cell_size={cell_size_m:g} m\n\n"
+                f"Cost factors:\n" + "\n".join(factor_lines) + "\n\n"
+                f"Mean cost: ${mean_c:,.0f}")
         else:
             messagebox.showinfo("Model costs", "No CLASS_RA cells found.")
 
@@ -3842,6 +3885,14 @@ class Annotator(tk.Tk):
         self._sel_row = self._sel_col = None
         self._title_var.set(
             f"{self._source_label}  —  {self._N}×{self._N} grid")
+        # Recompute cell_size_m for the new N
+        sq = self._renderer.sq_bounds_3857
+        if sq is not None:
+            extent_m = sq[2] - sq[0]
+            computed = round(extent_m / new_n, 2)
+            self._cell_size_var.set(computed)
+            self._cfg.cost.cell_size_m = computed
+            print(f"  [cell_size] N={new_n}  → cell_size_m={computed:,.2f} m")
         self._refresh()
         print(f"  [Grid] Resized to {new_n}×{new_n}")
  

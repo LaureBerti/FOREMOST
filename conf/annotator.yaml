@@ -3,20 +3,20 @@
 # ──────────────────────────────────────────────────────────────────────────
 
 data:
-  image_path: "./input/PEC/May10/LANDUSE_corrected.tif"   # path to PNG/JPG/GeoTIFF
+  image_path: "./input/PEC/Final/LANDUSE_corrected.tif"   # path to PNG/JPG/GeoTIFF
   gpkg_path:  ""       # path to GeoPackage (.gpkg/.shp/.geojson)
   layer:      ""       # GPKG layer name (empty = first layer)
-  N:          30             # grid size N×N
+  N:          100             # grid size N×N
 
 layers:
   elevation:
     enabled:   true
-    path:      ""   # e.g. "./input/PEC/ELEVATION_corrected.tif"
+    path:      "./input/PEC/Final/ELEVATION_corrected.tif"
     alpha:     0.35
     colormap:  "plasma"
   roads:
     enabled:   false
-    path:      ""   # e.g. "./input/PEC/ROADS_corrected.gpkg"
+    path:      "./input/PEC/Final/ROADS_corrected.gpkg"
     alpha:     0.65
     color:     "#e63946"
     linewidth: 1.6
@@ -35,8 +35,10 @@ layers:
     linewidth: 1.4
 
 cost:
-  default_cost: 100.0    # € per cell applied to CLASS_RA cells with no cost
-  auto_fill:    true     # fill missing costs automatically on export
+  default_cost:   100.0  # $ per cell applied to CLASS_RA cells with no cost
+  auto_fill:      true   # fill missing costs automatically on export
+  tree_unit_cost: 15.0   # $ per planted tree
+  tree_spacing_m: 2.5    # metres between trees (2–3 m → 1200–1700 trees/ha)
   # Slope-based accessibility filter applied at export time.
   # Cells where the 75th-percentile terrain slope (computed at native DEM
   # resolution, aggregated per planning unit) exceeds max_slope_deg are

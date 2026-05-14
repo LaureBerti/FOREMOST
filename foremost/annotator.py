@@ -2649,6 +2649,7 @@ class Annotator(tk.Tk):
                   relief=tk.FLAT, padx=5, pady=3,
                   command=self._clear_selected).pack(side=tk.LEFT, fill=tk.X, expand=True)
         # Auto-annotate button (requires GPKG or image background)
+        # Auto-annotate button (requires GPKG or image background)
         tk.Button(
             frame, text="🤖 Auto-label Habitat from image",
             font=FONT_SMALL, fg="#333942", bg=BG_MID,
