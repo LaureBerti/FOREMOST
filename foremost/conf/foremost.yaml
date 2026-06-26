@@ -15,28 +15,31 @@ data:
   image_path:       ""
   gpkg_path:        ""
   # mode=1: folder containing land_use_classify_{habitat,restorable,accessible,cost}_N*.npy
-  npy_folder:       "outputs/"
+  npy_folder:       "input/PEC/N100/"
   # mode=0 raster paths (leave empty to use synthetic data)
   habitat_path:     ""
   restorable_path:  ""
   accessible_path:  ""
   cost_path:        ""
   locked_out_path:  ""
-  elevation_path:   "input/PEC/ELEVATION_corrected.tif"
+  elevation_path:   "input/PEC/Final/ELEVATION_corrected.tif"
   # CRS / extent of the study area (EPSG:3857).
   # Used to compute sq_bounds and cell_size_m when running in mode=1.
   # PEC: Width=319 703 m, Height=664 415 m → square side = 664 415 m.
   working_crs:      "EPSG:3857"
 
 cost:
-  tree_unit_cost:          30.0   # € per tree
-  tree_spacing_m:          2.0    # metres between trees (planting density)
+  tree_unit_cost:          15.0   # $ per tree
+  tree_spacing_m:          2.5    # metres between trees (~1600 trees/ha, range 2–3 m)
   # cell_size_m MUST equal landscape_sq_extent_m / N for real raster runs.
   # Wrong value → wrong n_trees per cell and wrong slope gradient (NC5).
   #   PEC N= 30: 664415 /  30 ≈ 22147 m  → cell_size_m: 22147.0
   #   PEC N= 60: 664415 /  60 ≈ 11074 m  → cell_size_m: 11074.0
   #   PEC N=133: 664415 / 133 ≈  4996 m  → cell_size_m:  4996.0
   # Default 100.0 is correct ONLY for synthetic mode=0.
+
+  # Side length of one grid cell in metres.  Set by the QGIS plugin from the
+  # active grid extent / N.  For synthetic mode=0 the default 100.0 is fine.
   cell_size_m:             100.0
   inaccessible_surcharge:  0.4    # +40 % cost for road-inaccessible cells
   elevation_base_m:        0.0    # reference elevation (m); no penalty below this
@@ -54,7 +57,7 @@ constraints:
   max_diameter: 10     # max spatial diameter of restored zone in CELLS
   max_nb_cc: 20        # max connected components
   min_proportion: 0.0
-  max_cost: 20000      # EUR budget cap
+  max_cost: .inf       # R$ budget cap; set e.g. 5_000_000 for constrained scenarios
   min_app_compliance: 0.0   # NC6: fraction of restored cells in APPs (0.0=disabled)
   max_slope_deg: 30.0       # NC5: max terrain slope (degrees); matches slope-filter in annotation export
   min_patch_size: 0         # NC1: min cells per connected component (0=disabled)

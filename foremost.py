@@ -39,7 +39,7 @@ New features
      • restorable area per cell  (larger area → more trees → higher cost)
      • accessibility             (inaccessible cells bear a logistics surcharge)
      • elevation                 (high-altitude sites cost more to work)
-     • unit cost per tree        (configurable, e.g. 30 €/tree)
+     • unit cost per tree        (configurable, e.g. 15 $/tree)
  
 4. **Improved plot_solution()**
    • optional satellite/raster background in transparency (bg_image parameter)
@@ -86,6 +86,7 @@ Dependencies
 import shapely
 from annotation import annotate, CRS_WEB_MERCATOR, AnnotatorConfig
 import os
+import re
 import sys
 import textwrap
 import warnings
@@ -102,7 +103,12 @@ import matplotlib.patches as mpatches
 
 # from matplotlib.colors import Normalize
 import networkx as nx
-from scipy.ndimage import label as ndimage_label, generate_binary_structure, distance_transform_edt
+from scipy.ndimage import (
+    label as ndimage_label,
+    generate_binary_structure,
+    distance_transform_edt,
+)
+from scipy.spatial import cKDTree as _cKDTree
 
 # ── pymoo core (required) ─────────────────────────────────────────────────────
 from pymoo.algorithms.moo.nsga2 import NSGA2
@@ -162,6 +168,49 @@ _C = dict(
 SUPPORTED_ALGOS = ("GA", "NSGA2", "NSGA3", "CTAEA", "RNSGA3")
 
 
+def _fmt_cost(v: float, decimals: int = 2) -> str:
+    """Format a cost value in scientific notation with 4 significant figures.
+
+    Example: 123_400_000 → '1,234 × 10⁸ B$'
+    Comma is used as decimal separator; Unicode superscripts for the exponent.
+    """
+    import math as _math
+    if abs(v) < 1e-9:
+        return "0 B$"
+    exp = int(_math.floor(_math.log10(abs(v))))
+    mantissa = round(v / (10 ** exp), 3)
+    if abs(mantissa) >= 10:          # floating-point edge case e.g. 9.9995 → 10.000
+        mantissa = round(mantissa / 10, 3)
+        exp += 1
+    sup = str(exp).translate(str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻"))
+    return f"{mantissa:.3f}".replace(".", ",") + f" × 10{sup} B$"
+
+
+def _cost_scale_formatter(values):
+    """Shared-scale axis formatter for a collection of cost values.
+
+    Returns (FuncFormatter, label_suffix) where:
+      - FuncFormatter shows the mantissa only (e.g. '9,750') using a common
+        power-of-10 scale derived from min(values), so the smallest tick has
+        a mantissa in [1, 10) and all ticks share the same exponent.
+      - label_suffix is the "× 10^N B$" string that belongs once in the
+        axis or colorbar label (e.g. ' (× 10¹⁰ B$)').
+
+    This avoids repeating the exponent on every tick.
+    """
+    import math as _math
+    finite = [abs(v) for v in values if v == v and abs(v) < float("inf") and abs(v) > 0]
+    if not finite:
+        return plt.FuncFormatter(lambda v, _: "0"), " (B$)"
+    # Anchor on the minimum so the smallest tick reads ≥ 1 (e.g. 8,750 not 0,875)
+    exp = int(_math.floor(_math.log10(min(finite))))
+    scale = 10 ** exp
+    sup = str(exp).translate(str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻"))
+    label_suffix = f" (× 10{sup} B$)"
+    fmt = plt.FuncFormatter(lambda v, _: f"{v / scale:.3f}".replace(".", ","))
+    return fmt, label_suffix
+
+
 # =============================================================================
 # 0.  HYDRA CONFIGURATION
 # =============================================================================
@@ -196,9 +245,9 @@ class DataConfig:
 class CostConfig:
     """Parameters for compute_restoration_cost()."""
 
-    tree_unit_cost: float = 30.0  # € per tree
-    tree_spacing_m: float = 2.0  # metres between trees
-    cell_size_m: float = 100.0  # metres per raster cell side
+    tree_unit_cost: float = 15.0  # $ per tree
+    tree_spacing_m: float = 2.5  # metres between trees (~1600 trees/ha)
+    cell_size_m: float = 100.0  # fallback for synthetic mode; set to landscape_extent_m / N for real runs
     inaccessible_surcharge: float = 0.40  # +40 % for inaccessible cells
     elevation_base_m: float = 0.0  # reference elevation (m)
     elevation_slope: float = 0.005  # cost increase per metre elevation
@@ -236,7 +285,8 @@ class OptimizerConfig:
     """Algorithm and hyper-parameters."""
 
     algo: str = "NSGA2"  # GA | NSGA2 | NSGA3 | CTAEA | RNSGA3
-    objective: str = "FULL"  # MESH|IIC|COST|MESH_IIC|MESH_COST|IIC_COST|FULL
+    objective: str = "FULL"  # single objective (used when objectives list is empty)
+    objectives: list = field(default_factory=list)  # list of objective strings; when non-empty overrides objective
     pop_size: int = 80
     n_gen: int = 120
     seed: int = 42
@@ -297,9 +347,14 @@ def write_default_yaml(config_dir: Union[str, Path] = "conf") -> Path:
       elevation_path:   {cfg.data.elevation_path}   # optional DEM raster
  
     cost:
-      tree_unit_cost:          {cfg.cost.tree_unit_cost}   # € per tree
-      tree_spacing_m:          {cfg.cost.tree_spacing_m}   # metres between trees
-      cell_size_m:             {cfg.cost.cell_size_m}      # cell side length in metres
+      tree_unit_cost:          {cfg.cost.tree_unit_cost}   # $ per tree
+      tree_spacing_m:          {cfg.cost.tree_spacing_m}   # metres between trees (2–3 m → 1200–1700 trees/ha)
+      # cell_size_m is NOT set here — it must equal landscape_extent_m / N.
+      # Examples for PEC (square extent = 664 415 m):
+      #   N= 30 → cell_size_m: 22147.0
+      #   N= 60 → cell_size_m: 11074.0
+      #   N=100 → cell_size_m:  6644.0
+      # Override via CLI: python foremost.py cost.cell_size_m=6644
       inaccessible_surcharge:  {cfg.cost.inaccessible_surcharge}
       elevation_base_m:        {cfg.cost.elevation_base_m}
       elevation_slope:         {cfg.cost.elevation_slope}  # extra cost / metre elevation
@@ -434,6 +489,7 @@ class HabitatData:
     elevation: Optional[np.ndarray] = None
     bg_image: Optional[np.ndarray] = None
     app_mask: Optional[np.ndarray] = None  # binary N×N; 1 = APP zone (Forest Code Art. 61-A)
+    georef: Optional[dict] = None         # {"extent": [xmin,ymin,xmax,ymax], "crs": "EPSG:…"}
 
     def __post_init__(self):
         shapes = dict(
@@ -734,8 +790,8 @@ def compute_restoration_cost(
     data: HabitatData,
     cfg: Optional[CostConfig] = None,
     *,
-    tree_unit_cost: float = 30.0,
-    tree_spacing_m: float = 2.0,
+    tree_unit_cost: float = 15.0,
+    tree_spacing_m: float = 2.5,
     cell_size_m: float = 100.0,
     inaccessible_surcharge: float = 0.40,
     elevation_base_m: float = 0.0,
@@ -750,7 +806,7 @@ def compute_restoration_cost(
     The cost of restoring a cell is modelled as:
 
         cost(i,j) = n_trees(i,j)              # trees needed
-                  × tree_unit_cost             # €/tree
+                  × tree_unit_cost             # $/tree
                   × accessibility_factor(i,j) # logistics surcharge
                   × elevation_factor(i,j)     # altitude penalty
                   × (1 + ε)                   # multiplicative noise
@@ -773,7 +829,7 @@ def compute_restoration_cost(
     ----------
     data    : HabitatData with restorable, accessible, and optionally elevation
     cfg     : CostConfig dataclass (takes precedence over keyword arguments)
-    tree_unit_cost         : € per planted tree
+    tree_unit_cost         : $ per planted tree
     tree_spacing_m         : planting density (m between trees)
     cell_size_m            : side length of one raster cell in metres
     inaccessible_surcharge : fractional cost increase for inaccessible cells (e.g. 0.4 = +40%)
@@ -788,13 +844,13 @@ def compute_restoration_cost(
            Zero on existing-habitat and nodata cells.
     """
     if cfg is not None:
-        tree_unit_cost = cfg.tree_unit_cost
-        tree_spacing_m = cfg.tree_spacing_m
-        cell_size_m = cfg.cell_size_m
-        inaccessible_surcharge = cfg.inaccessible_surcharge
-        elevation_base_m = cfg.elevation_base_m
-        elevation_slope = cfg.elevation_slope
-        noise_sigma = cfg.noise_sigma
+        tree_unit_cost         = getattr(cfg, "tree_unit_cost",         tree_unit_cost)
+        tree_spacing_m         = getattr(cfg, "tree_spacing_m",         tree_spacing_m)
+        cell_size_m            = getattr(cfg, "cell_size_m",            cell_size_m)
+        inaccessible_surcharge = getattr(cfg, "inaccessible_surcharge", inaccessible_surcharge)
+        elevation_base_m       = getattr(cfg, "elevation_base_m",       elevation_base_m)
+        elevation_slope        = getattr(cfg, "elevation_slope",        elevation_slope)
+        noise_sigma            = getattr(cfg, "noise_sigma",            noise_sigma)
 
     nrows, ncols = data.shape
     rng = np.random.default_rng(seed)
@@ -873,7 +929,9 @@ _CONN8 = generate_binary_structure(2, 2)
 def compute_patches(habitat_grid: np.ndarray) -> tuple:
     """8-connected patch labelling. Returns (labeled, n_patches, areas_cells)."""
     labeled, n = ndimage_label(habitat_grid == 1, structure=_CONN8)
-    areas = np.array([(labeled == p).sum() for p in range(1, n + 1)])
+    if n == 0:
+        return labeled, n, np.array([], dtype=np.int64)
+    _, areas = np.unique(labeled[labeled > 0], return_counts=True)
     return labeled, n, areas
 
 
@@ -925,30 +983,33 @@ def iic(
         return 0.0
     A_L = total_cells * cell_area
     a = areas * cell_area
+
+    # Build patch connectivity graph via KDTree (Chebyshev / L-inf metric).
+    # Single query over all habitat cells — O(m log m) vs O(n × m²) dilation.
     G = nx.Graph()
     G.add_nodes_from(range(n))
-    # Precompute patch cell coordinates
-    coords = [np.argwhere(labeled == p + 1) for p in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            # Chebyshev distance between all pairs of cells
-            d = np.abs(coords[i][:, None, :] - coords[j][None, :, :]).max(axis=2)
-            if d.min() <= max_dist:
-                G.add_edge(i, j)
-    # IIC numerator
-    num = 0.0
-    for i in range(n):
-        for j in range(n):
-            nl = (
-                0
-                if i == j
-                else (
-                    nx.shortest_path_length(G, i, j) if nx.has_path(G, i, j) else None
-                )
-            )
-            if nl is not None:
-                num += (a[i] * a[j]) / (1 + nl)
-    return float(num / (A_L**2))
+    all_coords = np.argwhere(labeled > 0)          # (m, 2) — all habitat cells
+    all_labels = labeled[all_coords[:, 0], all_coords[:, 1]]  # patch label per cell
+    tree = _cKDTree(all_coords)
+    neighbor_lists = tree.query_ball_tree(tree, r=max_dist, p=np.inf)
+    for idx, nbrs in enumerate(neighbor_lists):
+        li = int(all_labels[idx])
+        for ni in nbrs:
+            lj = int(all_labels[ni])
+            if lj > li:
+                G.add_edge(li - 1, lj - 1)
+
+    # All-pairs shortest path lengths in one BFS sweep, then vectorised sum.
+    spl = dict(nx.all_pairs_shortest_path_length(G))
+    NL = np.full((n, n), np.inf)
+    for src, dsts in spl.items():
+        for dst, length in dsts.items():
+            NL[src, dst] = length
+
+    finite = np.isfinite(NL)
+    ai_aj = a[:, None] * a[None, :]
+    num = float(np.sum(ai_aj[finite] / (1.0 + NL[finite])))
+    return float(num / (A_L ** 2))
 
 
 # =============================================================================
@@ -1473,7 +1534,7 @@ def _build_algorithm(
         if n_obj < 2:
             warnings.warn("CTAEA is multi-objective; using NSGA2 for Single-objective.")
             return NSGA2(**common)
-        n_part = max(4, pop_size // (n_obj * 3))
+        n_part = max(4, min(pop_size // (n_obj * 3), 12))
         ref_dirs = get_reference_directions("das-dennis", n_obj, n_partitions=n_part)
         # CTAEA sets pop_size from ref_dirs — pass only operators, not pop_size
         ctaea_kwargs = {k: v for k, v in common.items()
@@ -1879,7 +1940,7 @@ def plot_solution(
     metrics = [
         ("Restored cells", f"{solution['n_restored_cells']}", _C["restored"]),
         ("Restored area", f"{solution['total_restored_area']:.3f}", "#52b788"),
-        ("Total cost", f"{solution['total_cost']:.2f}", _C["accent"]),
+        ("Total cost", _fmt_cost(solution["total_cost"]), _C["accent"]),
         ("MESH", f"{solution['mesh']:.5f}", _C["habitat"]),
         ("IIC", f"{solution['iic']:.7f}", "#1d6a96"),
         ("Diameter (cells)", f"{solution['diameter_cells']}", "#6d6875"),
@@ -1975,19 +2036,30 @@ def plot_pareto_front(
     subtitle = _algo_subtitle(algo_name, objective.value)
 
     fig, ax = plt.subplots(figsize=figsize, facecolor=_C["bg"])
+    n_min, n_max = min(n_cells), max(n_cells)
+    n_range = max(n_max - n_min, 1)
+    sizes = [20 + 180 * (n - n_min) / n_range for n in n_cells]
     sc = ax.scatter(
         xv,
         yv,
         c=costs,
         cmap="YlOrRd",
-        s=[25 + 7 * n for n in n_cells],
+        s=sizes,
         edgecolors="#555",
         linewidths=0.4,
         alpha=0.85,
         zorder=3,
     )
-    cb = plt.colorbar(sc, ax=ax, label="Total restoration cost")
+    _cfmt, _csuffix = _cost_scale_formatter(costs)
+    cb = plt.colorbar(sc, ax=ax, label=f"Total restoration cost{_csuffix}")
     cb.ax.yaxis.label.set_fontsize(10)
+    cb.ax.yaxis.set_major_formatter(_cfmt)
+    if "cost" in xl.lower():
+        ax.xaxis.set_major_formatter(_cfmt)
+        xl = f"Total cost{_csuffix}"
+    if "cost" in yl.lower():
+        ax.yaxis.set_major_formatter(_cfmt)
+        yl = f"Total cost{_csuffix}"
     ax.set_xlabel(xl, fontsize=12)
     ax.set_ylabel(yl, fontsize=12)
     ax.set_title(
@@ -2000,19 +2072,27 @@ def plot_pareto_front(
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.set_facecolor("#fafafa")
 
-    # Annotate extremes
-    for idx, lbl in [
-        (np.argmin(xv) if not inv_x else np.argmax(xv), f"Best\n{xl}"),
-        (np.argmax(yv) if inv_y else np.argmin(yv), f"Best\n{yl}"),
-    ]:
+    # Annotate extremes — alternate quadrants so labels never overlap
+    _short = lambda s: s.split("(")[0].strip()   # drop "(× 10^N B$)" from axis label
+    _extremes = [
+        (np.argmin(xv) if not inv_x else np.argmax(xv), f"Best {_short(xl)}", ( 50,  28)),
+        (np.argmax(yv) if inv_y else np.argmin(yv),      f"Best {_short(yl)}", (-60, -36)),
+    ]
+    _seen = set()
+    for idx, lbl, xytext in _extremes:
+        pt = (round(xv[idx], 6), round(yv[idx], 6))
+        if pt in _seen:
+            continue          # skip duplicate when both extremes are the same solution
+        _seen.add(pt)
         ax.annotate(
             lbl,
             xy=(xv[idx], yv[idx]),
-            xytext=(12, 12),
+            xytext=xytext,
             textcoords="offset points",
             fontsize=8,
             color=_C["accent"],
             arrowprops=dict(arrowstyle="->", color=_C["accent"], lw=1.2),
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7),
         )
 
     plt.tight_layout()
@@ -2056,10 +2136,13 @@ def plot_pareto_front_3d(
         linewidths=0.3,
         alpha=0.8,
     )
-    plt.colorbar(sc, ax=ax, label="Total cost", shrink=0.6, pad=0.1)
+    _cfmt3d, _csuffix3d = _cost_scale_formatter(cost_v)
+    cb3d = plt.colorbar(sc, ax=ax, label=f"Total cost{_csuffix3d}", shrink=0.6, pad=0.1)
+    cb3d.ax.yaxis.set_major_formatter(_cfmt3d)
     ax.set_xlabel("MESH", fontsize=10, labelpad=8)
     ax.set_ylabel("IIC", fontsize=10, labelpad=8)
-    ax.set_zlabel("Total cost", fontsize=10, labelpad=8)
+    ax.set_zlabel(f"Total cost{_csuffix3d}", fontsize=10, labelpad=8)
+    ax.zaxis.set_major_formatter(_cfmt3d)
     ax.set_title(
         f"3-D Pareto front — FULL{algo_tag}\n"
         f"({len(solutions)} non-dominated solutions)",
@@ -2166,7 +2249,7 @@ def plot_solutions_comparison(
             ab.text(
                 norm_v + 0.02,
                 yi,
-                f"{mval:.3f}",
+                _fmt_cost(mval) if mlabel == "Cost" else f"{mval:.3f}",
                 va="center",
                 ha="left",
                 fontsize=7.5,
@@ -2187,6 +2270,273 @@ def plot_solutions_comparison(
         plt.show()
     else:
         plt.close(fig)
+
+
+
+# ── _knee_point_3d ────────────────────────────────────────────────────────────
+
+
+def _knee_point_3d(solutions: List[dict]) -> dict:
+    """
+    Select the balanced ("knee") solution from a 3-objective MESH × IIC × Cost
+    Pareto front using the closest-to-ideal heuristic.
+
+    Each objective is normalised to [0, 1] (0 = best, 1 = worst).
+    The solution with minimum Euclidean distance to the ideal point (0, 0, 0)
+    is returned.  Falls back to the first solution when the front is trivial.
+    """
+    if len(solutions) == 1:
+        return solutions[0]
+
+    mesh = np.array([s["mesh"]       for s in solutions], dtype=float)
+    iic  = np.array([s["iic"]        for s in solutions], dtype=float)
+    cost = np.array([s["total_cost"] for s in solutions], dtype=float)
+
+    def _norm(v: np.ndarray, hi_is_good: bool) -> np.ndarray:
+        lo, hi = v.min(), v.max()
+        if hi == lo:
+            return np.zeros_like(v)
+        n = (v - lo) / (hi - lo)
+        return (1.0 - n) if hi_is_good else n
+
+    dist = np.sqrt(
+        _norm(mesh, hi_is_good=True)  ** 2 +
+        _norm(iic,  hi_is_good=True)  ** 2 +
+        _norm(cost, hi_is_good=False) ** 2
+    )
+    idx = int(np.argmin(dist))
+    print(f"  [knee] Selected solution {idx + 1}/{len(solutions)}: "
+          f"MESH={mesh[idx]:.3f}  IIC={iic[idx]:.4f}  "
+          f"Cost={_fmt_cost(cost[idx])}")
+    return solutions[idx]
+
+
+# ── plot_restoration_map ──────────────────────────────────────────────────────
+
+
+def plot_restoration_map(
+    data: HabitatData,
+    solution: dict,
+    out_path: str,
+    label: str = "",
+    algo_name: Optional[str] = None,
+    bg_alpha: float = 0.30,
+    dpi: int = 150,
+    show: bool = False,
+) -> None:
+    """
+    Publication-quality single-panel restoration map for the knee / best
+    3-objective Pareto solution.
+
+    Cell colour key
+    ---------------
+    Dark green  : existing habitat
+    Orange      : selected for restoration
+    Light amber : restorable but not selected
+    Light grey  : non-restorable / other
+    """
+    nrows, ncols = data.habitat.shape
+    sel_grid = solution["selection_grid"]  # 0/1 N×N
+
+    # ── categorical grid: 0=other, 1=habitat, 2=restorable(no sel), 3=selected ─
+    cat = np.zeros((nrows, ncols), dtype=np.uint8)
+    cat[data.restorable > 0] = 2
+    cat[data.habitat == 1]   = 1
+    cat[sel_grid == 1]       = 3
+
+    nodata_mask = data.habitat == data.nodata_value
+
+    cmap = mcolors.ListedColormap(["#f0f0f0", "#2d6a4f", "#ffe0a0", "#f4a261"])
+    norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8), facecolor="white")
+
+    if data.bg_image is not None:
+        _overlay_bg(ax, data.bg_image, alpha=bg_alpha)
+
+    ax.imshow(cat, cmap=cmap, norm=norm, interpolation="nearest",
+              origin="upper", alpha=0.85, zorder=2)
+
+    # mask nodata cells with opaque white
+    if nodata_mask.any():
+        nodata_rgba = np.ones((nrows, ncols, 4), dtype=np.float32)
+        nodata_rgba[~nodata_mask, 3] = 0.0
+        ax.imshow(nodata_rgba, origin="upper", interpolation="nearest", zorder=3)
+
+    # ── legend ────────────────────────────────────────────────────────────────
+    legend_items = [
+        mpatches.Patch(facecolor="#2d6a4f", label="Existing habitat"),
+        mpatches.Patch(facecolor="#f4a261", label="Selected for restoration"),
+        mpatches.Patch(facecolor="#ffe0a0", edgecolor="#bbb",
+                       label="Restorable (not selected)"),
+        mpatches.Patch(facecolor="#f0f0f0", edgecolor="#aaa", label="Other"),
+    ]
+    ax.legend(handles=legend_items, loc="lower center",
+              bbox_to_anchor=(0.5, -0.14), ncol=2, fontsize=10,
+              frameon=True, framealpha=0.9)
+
+    # ── metrics inset ─────────────────────────────────────────────────────────
+    mesh_v  = solution.get("mesh", float("nan"))
+    iic_v   = solution.get("iic",  float("nan"))
+    cost_v  = solution.get("total_cost", float("nan"))
+    n_cells = solution.get("n_restored_cells", 0)
+    n_cc    = solution.get("n_connected_components", "—")
+    diam    = solution.get("diameter_cells", "—")
+
+    metrics_text = (
+        f"MESH  : {mesh_v:.3f}\n"
+        f"IIC   : {iic_v:.4f}\n"
+        f"Cost  : {_fmt_cost(cost_v)}\n"
+        f"Cells : {n_cells}  |  CC: {n_cc}  |  Ø: {diam}"
+    )
+    ax.text(0.02, 0.98, metrics_text,
+            transform=ax.transAxes, fontsize=9, va="top", ha="left",
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                      edgecolor="#cccccc", alpha=0.88),
+            zorder=10)
+
+    # ── title and grid ────────────────────────────────────────────────────────
+    algo_tag = f"  [{algo_name}]" if algo_name else ""
+    title_lines = [f"Best 3-objective Pareto solution{algo_tag}"]
+    if label:
+        title_lines.append(label)
+    ax.set_title("\n".join(title_lines), fontsize=12, fontweight="bold", pad=8)
+
+    ax.set_xticks(np.arange(-0.5, ncols, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, nrows, 1), minor=True)
+    ax.grid(which="minor", color="#cccccc", linewidth=0.3, zorder=1)
+    ax.tick_params(which="both", bottom=False, left=False,
+                   labelbottom=False, labelleft=False)
+
+    plt.tight_layout(rect=[0, 0.12, 1, 1])
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight", dpi=dpi)
+    print(f"  Saved \u2192 {out_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+# ── export_raster_mask ────────────────────────────────────────────────────────
+
+
+def _save_pareto_selections(solutions: list, npz_path: str) -> None:
+    """Save selection_grid for every Pareto solution into a compressed .npz (sel_0…sel_N)."""
+    arrays = {}
+    for i, s in enumerate(solutions):
+        sg = s.get("selection_grid")
+        if sg is not None:
+            arrays[f"sel_{i}"] = sg.astype(np.uint8)
+    if arrays:
+        os.makedirs(os.path.dirname(npz_path) or ".", exist_ok=True)
+        np.savez_compressed(npz_path, **arrays)
+        print(f"[npz] Pareto selections saved: {npz_path}  ({len(arrays)} solutions)")
+
+
+def export_raster_mask(
+    data: HabitatData,
+    solution: dict,
+    out_dir: str,
+    pfx: str,
+    cfg=None,
+    suffix: str = "best_pareto3d_mask",
+) -> None:
+    """
+    Export the binary restoration mask of a Pareto solution.
+
+    Always saves  <out_dir>/<pfx>_{suffix}.npy  (uint8, 0/1).
+    Also saves a georeferenced GeoTIFF when rasterio is importable.
+
+    Spatial extent priority:
+      1. data.georef  — set from the QGIS plugin session JSON (exact grid extent)
+      2. cfg.data.elevation_path — bounding box + CRS read from the raster
+    Selected cells (value=1) are written; unselected (value=0) are nodata → transparent.
+    """
+    sel_grid = solution.get("selection_grid")
+    if sel_grid is None:
+        print("[export_raster_mask] selection_grid missing — skipping.")
+        return
+
+    mask = sel_grid.astype(np.uint8)
+    os.makedirs(out_dir, exist_ok=True)
+
+    npy_path = f"{out_dir}/{pfx}_{suffix}.npy"
+    np.save(npy_path, mask)
+    print(f"  Saved \u2192 {npy_path}")
+
+    # ── GeoTIFF (optional) ────────────────────────────────────────────────────
+    try:
+        import rasterio as _rio
+        from rasterio.transform import from_bounds as _from_bounds
+        from rasterio.crs import CRS as _CRS
+    except ImportError:
+        print("  [export_raster_mask] rasterio not available — GeoTIFF skipped.")
+        return
+
+    sq_bounds = None
+    working_crs = "EPSG:3857"
+
+    # Priority 1: georef from QGIS plugin session JSON (exact planning-grid extent)
+    if data.georef is not None:
+        ext = data.georef.get("extent", [])
+        crs_auth = data.georef.get("crs", "")
+        if len(ext) == 4:
+            xmin, ymin, xmax, ymax = ext
+            span = max(xmax - xmin, ymax - ymin)
+            cx = (xmin + xmax) / 2
+            cy = (ymin + ymax) / 2
+            sq_bounds = (cx - span / 2, cy - span / 2,
+                         cx + span / 2, cy + span / 2)
+            if crs_auth:
+                working_crs = crs_auth
+            print(f"  [export_raster_mask] georef from session JSON  "
+                  f"extent={ext}  crs={working_crs}")
+
+    # Priority 2: derive extent + CRS from elevation raster
+    if sq_bounds is None and cfg is not None:
+        working_crs = getattr(getattr(cfg, "data", None), "working_crs", working_crs)
+        elev_path = getattr(getattr(cfg, "data", None), "elevation_path", "")
+        if elev_path and os.path.isfile(elev_path):
+            try:
+                with _rio.open(elev_path) as src:
+                    b = src.bounds
+                    span = max(b.right - b.left, b.top - b.bottom)
+                    cx = (b.left + b.right) / 2
+                    cy = (b.bottom + b.top) / 2
+                    sq_bounds = (cx - span / 2, cy - span / 2,
+                                 cx + span / 2, cy + span / 2)
+                    if src.crs is not None:
+                        working_crs = src.crs.to_string()
+                    print(f"  [export_raster_mask] sq_bounds from "
+                          f"{os.path.basename(elev_path)}  crs={working_crs}")
+            except Exception as exc:
+                print(f"  [export_raster_mask] Could not read elevation raster: {exc}")
+
+    if sq_bounds is None:
+        print("  [export_raster_mask] No spatial extent available — GeoTIFF skipped.")
+        return
+
+    nrows, ncols = mask.shape
+    west, south, east, north = sq_bounds
+    transform = _from_bounds(west, south, east, north, ncols, nrows)
+
+    tif_path = f"{out_dir}/{pfx}_{suffix}.tif"
+    with _rio.open(
+        tif_path, "w",
+        driver="GTiff",
+        height=nrows,
+        width=ncols,
+        count=1,
+        dtype=_rio.uint8,
+        crs=_CRS.from_string(working_crs),
+        transform=transform,
+        nodata=0,
+        compress="lzw",
+    ) as dst:
+        dst.write(mask, 1)
+    print(f'  Saved \u2192 {tif_path}')
 
 
 # ── plot_cost_surface ─────────────────────────────────────────────────────────
@@ -2252,7 +2602,7 @@ def plot_cost_surface(
     im = ax.imshow(
         cost_disp, cmap="YlOrRd", interpolation="nearest", alpha=0.9, zorder=1
     )
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="€ / cell")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="$ / cell")
     ax.set_title(
         "Restoration cost\n(area × accessibility × elevation × tree cost)",
         fontsize=11,
@@ -2289,7 +2639,7 @@ class ForemostProblemBuilder:
     ...     .add_restorable_constraint(min_restore=20.0, max_restore=100.0)
     ...     .add_compactness_constraint(max_diameter=9)
     ...     .add_connected_constraint(max_nb_cc=10)
-    ...     .add_budget_constraint(max_cost=20000.0)
+    ...     .add_budget_constraint(max_cost=5_000_000.0)
     ...     .solve(pop_size=100, n_gen=100, algo="CTAEA")
     ... )
     """
@@ -2339,7 +2689,7 @@ class ForemostProblemBuilder:
         max_diameter: float = 10.0,
         max_nb_cc: int = 10,
         min_proportion: float = 0.0,
-        max_cost: float = 20000,
+        max_cost: float = float("inf"),
     ) -> "ForemostProblemBuilder":
 
         self._constraints.min_restore = min_restore
@@ -2470,10 +2820,11 @@ def load_npy_arrays(folder: str) -> dict:
     if not npy_files:
         raise FileNotFoundError(f"No .npy files in {folder}")
 
+    matched: dict[str, Path] = {}
+
     def _find(kw: str) -> np.ndarray:
         hits = [f for f in npy_files if kw.lower() in f.name.lower()]
         if not hits:
-            # "cost" also matches "cout"
             if kw == "cost":
                 hits = [f for f in npy_files if "cout" in f.name.lower()]
             if not hits:
@@ -2481,10 +2832,13 @@ def load_npy_arrays(folder: str) -> dict:
                     f"No .npy file matching '{kw}' in {folder}\n"
                     f"  Found: {[f.name for f in npy_files]}"
                 )
+        matched[kw] = hits[0]
         print(f"  [{kw:>12s}]  ← {hits[0].name}")
         return np.load(str(hits[0]))
 
-    return {k: _find(k) for k in ("habitat", "restorable", "accessible", "cost")}
+    arrays = {k: _find(k) for k in ("habitat", "restorable", "accessible", "cost")}
+    arrays["_matched_files"] = matched   # carry file metadata for prefix derivation
+    return arrays
 
 
 def _arrays_to_habitatdata(arrays: dict, cell_area: float = 1.0) -> "HabitatData":
@@ -2541,27 +2895,143 @@ def load_habitatdata_from_npy(npy_dir: str = "outputs/", cell_area: float = 1.0)
 
 def _save_pareto_csv(solutions: list, csv_path: str,
                      hypervolume: float = float("nan"),
-                     algo: str = "") -> None:
-    """Save FULL Pareto front solutions to a CSV for downstream analysis.
+                     algo: str = "",
+                     knee_solution: Optional[dict] = None,
+                     cell_size_m: float = 0.0) -> None:
+    """Save a Pareto front to CSV with full per-solution metrics.
 
-    Columns: cost, mesh, iic, n_cells, total_area
-    A header comment line records the algo name and HV value.
+    Columns: rank, mesh, iic, cost, cost_per_ha, n_cells, total_area,
+             n_cc, diameter_cells, n_patches, is_knee
+    cost_per_ha = total_cost / (n_cells × cell_size_m² / 10 000) — resolution-normalized cost.
+    First row is a metadata comment (algo, HV).
     """
     import csv as _csv
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    knee_id = id(knee_solution) if knee_solution is not None else None
     with open(csv_path, "w", newline="") as fh:
         writer = _csv.writer(fh)
-        writer.writerow([f"# algo={algo}  hypervolume={hypervolume:.6f}"])
-        writer.writerow(["cost", "mesh", "iic", "n_cells", "total_area"])
-        for s in solutions:
+        writer.writerow([f"# algo={algo}  hypervolume={hypervolume:.6f}"
+                         f"  n_solutions={len(solutions)}"
+                         f"  cell_size_m={cell_size_m:.2f}"])
+        writer.writerow([
+            "rank", "mesh", "iic", "cost", "cost_per_ha",
+            "n_cells", "total_area",
+            "n_cc", "diameter_cells", "n_patches",
+            "is_knee",
+        ])
+        for rank, s in enumerate(solutions, start=1):
+            n_cells = int(s.get("n_restored_cells", 0))
+            cost    = s.get("total_cost", 0.0)
+            phys_ha = n_cells * cell_size_m ** 2 / 1e4 if cell_size_m > 0 else 0.0
+            cost_per_ha = cost / phys_ha if phys_ha > 0 else float("nan")
             writer.writerow([
-                f"{s.get('total_cost', 0.0):.4f}",
+                rank,
                 f"{s.get('mesh', 0.0):.6f}",
                 f"{s.get('iic', 0.0):.8f}",
-                int(s.get("n_restored_cells", 0)),
+                f"{cost:.2f}",
+                f"{cost_per_ha:.4f}" if cost_per_ha == cost_per_ha else "nan",
+                n_cells,
                 f"{s.get('total_restored_area', 0.0):.4f}",
+                int(s.get("n_connected_components", 0)),
+                int(s.get("diameter_cells", 0)),
+                int(s.get("n_patches", 0)),
+                1 if (knee_id is not None and id(s) == knee_id) else 0,
             ])
     print(f"[csv] Pareto front saved: {csv_path}  ({len(solutions)} solutions)")
+
+
+def _save_results_summary_csv(
+    runs: list,          # list of (objective_label, result_dict)
+    csv_path: str,
+    cell_size_m: float = 0.0,
+) -> None:
+    """Save one-row-per-run summary table.
+
+    Columns: objective, algo, n_solutions, hypervolume, pop_feasibility_rate,
+             mesh_min, mesh_max, iic_min, iic_max,
+             cost_min, cost_max, cost_per_ha_min, cost_per_ha_max,
+             knee_mesh, knee_iic, knee_cost, knee_cost_per_ha, knee_n_cells
+    cost_per_ha = total_cost / (n_cells × cell_size_m² / 10 000).
+    """
+    import csv as _csv
+
+    def _cph(cost, n_cells):
+        phys_ha = n_cells * cell_size_m ** 2 / 1e4 if cell_size_m > 0 else 0.0
+        return cost / phys_ha if phys_ha > 0 else float("nan")
+
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    header = [
+        "objective", "algo", "n_solutions", "hypervolume", "pop_feasibility_rate",
+        "mesh_min", "mesh_max",
+        "iic_min", "iic_max",
+        "cost_min", "cost_max",
+        "cost_per_ha_min", "cost_per_ha_max",
+        "knee_mesh", "knee_iic", "knee_cost", "knee_cost_per_ha", "knee_n_cells",
+    ]
+    with open(csv_path, "w", newline="") as fh:
+        writer = _csv.writer(fh)
+        writer.writerow(header)
+        for obj_label, res in runs:
+            sols = res.get("solutions", [])
+            if not sols:
+                continue
+            mesh_vals  = [s.get("mesh",       float("nan")) for s in sols]
+            iic_vals   = [s.get("iic",        float("nan")) for s in sols]
+            cost_vals  = [s.get("total_cost", float("nan")) for s in sols]
+            cph_vals   = [_cph(s.get("total_cost", 0.0), s.get("n_restored_cells", 0))
+                          for s in sols]
+            # knee: for 3-obj fronts use _knee_point_3d; for 2-obj or 1-obj use first
+            if len(mesh_vals) > 1 and not all(v == mesh_vals[0] for v in iic_vals):
+                knee = _knee_point_3d(sols)
+            else:
+                knee = sols[0]
+            knee_cph = _cph(knee.get("total_cost", 0.0), knee.get("n_restored_cells", 0))
+            writer.writerow([
+                obj_label,
+                res.get("algo_name", ""),
+                len(sols),
+                f"{res.get('hypervolume', float('nan')):.6f}",
+                f"{res.get('pop_feasibility_rate', float('nan')):.4f}",
+                f"{min(mesh_vals):.6f}",  f"{max(mesh_vals):.6f}",
+                f"{min(iic_vals):.8f}",   f"{max(iic_vals):.8f}",
+                f"{min(cost_vals):.2f}",  f"{max(cost_vals):.2f}",
+                f"{min(cph_vals):.4f}",   f"{max(cph_vals):.4f}",
+                f"{knee.get('mesh', float('nan')):.6f}",
+                f"{knee.get('iic',  float('nan')):.8f}",
+                f"{knee.get('total_cost', float('nan')):.2f}",
+                f"{knee_cph:.4f}" if knee_cph == knee_cph else "nan",
+                int(knee.get("n_restored_cells", 0)),
+            ])
+    print(f"[csv] Results summary saved: {csv_path}  ({len(runs)} runs)")
+
+
+def _save_knee_csv(solution: dict, csv_path: str, algo: str = "",
+                   objective: str = "FULL", cell_size_m: float = 0.0) -> None:
+    """Save the knee (best balanced) 3-D Pareto solution as a single-row CSV."""
+    import csv as _csv
+    n_cells  = int(solution.get("n_restored_cells", 0))
+    cost     = solution.get("total_cost", float("nan"))
+    phys_ha  = n_cells * cell_size_m ** 2 / 1e4 if cell_size_m > 0 else 0.0
+    cost_per_ha = cost / phys_ha if phys_ha > 0 else float("nan")
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    fields = [
+        ("objective",        objective),
+        ("algo",             algo),
+        ("mesh",             f"{solution.get('mesh', float('nan')):.6f}"),
+        ("iic",              f"{solution.get('iic',  float('nan')):.8f}"),
+        ("cost",             f"{cost:.2f}"),
+        ("cost_per_ha",      f"{cost_per_ha:.4f}" if cost_per_ha == cost_per_ha else "nan"),
+        ("n_cells",          n_cells),
+        ("total_area",       f"{solution.get('total_restored_area', 0.0):.4f}"),
+        ("n_cc",             int(solution.get("n_connected_components", 0))),
+        ("diameter_cells",   int(solution.get("diameter_cells", 0))),
+        ("n_patches",        int(solution.get("n_patches", 0))),
+    ]
+    with open(csv_path, "w", newline="") as fh:
+        writer = _csv.writer(fh)
+        writer.writerow([k for k, _ in fields])
+        writer.writerow([v for _, v in fields])
+    print(f"[csv] Knee solution saved: {csv_path}")
 
 
 def _run_all_objectives(
@@ -2727,11 +3197,63 @@ def _run_all_objectives(
         show=show,
     )
 
-    # ── Export FULL Pareto front to CSV for downstream analysis ───────────────
-    # Columns: cost, mesh, iic, n_cells, total_area  (+ HV in header comment)
-    _save_pareto_csv(r_full["solutions"], f"{out_dir}/{pfx}_pareto.csv",
-                     hypervolume=r_full.get("hypervolume", float("nan")),
-                     algo=r_full["algo_name"])
+    # ── CSV exports ───────────────────────────────────────────────────────────
+    _csm = cfg.cost.cell_size_m   # metres per cell side — needed for cost_per_ha
+
+    # 2-objective Pareto fronts
+    _save_pareto_csv(
+        r_mc["solutions"], f"{out_dir}/{pfx}_pareto_mesh_cost.csv",
+        hypervolume=r_mc.get("hypervolume", float("nan")),
+        algo=r_mc["algo_name"], cell_size_m=_csm,
+    )
+    _save_pareto_csv(
+        r_ic["solutions"], f"{out_dir}/{pfx}_pareto_iic_cost.csv",
+        hypervolume=r_ic.get("hypervolume", float("nan")),
+        algo=r_ic["algo_name"], cell_size_m=_csm,
+    )
+
+    # 3-objective FULL Pareto front (with knee flag)
+    _best = _knee_point_3d(r_full["solutions"]) if r_full["solutions"] else None
+    _save_pareto_csv(
+        r_full["solutions"], f"{out_dir}/{pfx}_pareto_full.csv",
+        hypervolume=r_full.get("hypervolume", float("nan")),
+        algo=r_full["algo_name"],
+        knee_solution=_best, cell_size_m=_csm,
+    )
+
+    # Knee solution single-row record
+    if _best is not None:
+        _save_knee_csv(
+            _best, f"{out_dir}/{pfx}_knee_solution.csv",
+            algo=r_full["algo_name"], objective="FULL", cell_size_m=_csm,
+        )
+
+    # Per-run summary (one row per objective)
+    _save_results_summary_csv(
+        [
+            ("MESH",      r_mesh),
+            ("IIC",       r_iic),
+            ("COST",      r_cost),
+            ("MESH_COST", r_mc),
+            ("IIC_COST",  r_ic),
+            ("FULL",      r_full),
+        ],
+        f"{out_dir}/{pfx}_summary.csv",
+        cell_size_m=_csm,
+    )
+
+    # ── Best 3-D Pareto solution: restoration map + raster mask ─────────────
+    if _best is not None:
+        plot_restoration_map(
+            data, _best,
+            out_path=f"{out_dir}/{pfx}_best_pareto3d_map.png",
+            label=label,
+            algo_name=r_full["algo_name"],
+            bg_alpha=0.30,
+            dpi=cfg.output.dpi,
+            show=show,
+        )
+        export_raster_mask(data, _best, out_dir=out_dir, pfx=pfx, cfg=cfg)
 
     print(f"\n  Demo complete — outputs saved to {out_dir}/")
     return r_mesh, r_iic, r_cost, r_mc, r_ic, r_full
@@ -2788,13 +3310,189 @@ def _run_mode0(cfg: "ForemostConfig") -> tuple:
     return results
 
 
+# ── Single-objective dispatcher (used by MODE 1 and MODE 2) ──────────────────
+
+
+def _run_selected_objective(
+    data: "HabitatData",
+    cfg:  "RestoptConfig",
+    out_dir: str,
+    pfx: str,
+    label: str = "",
+) -> tuple:
+    """
+    Run only the objective named in ``cfg.optimizer.objective``.
+
+    Returns a 1-tuple containing the result dict of the chosen run,
+    so callers can always do ``results[0]`` to get the result.
+    Saves exactly the figures / CSVs relevant to that objective.
+    """
+    cc = dict(
+        min_restore=cfg.constraints.min_restore,
+        max_restore=cfg.constraints.max_restore,
+        max_diameter=cfg.constraints.max_diameter,
+        max_nb_cc=cfg.constraints.max_nb_cc,
+    )
+    algo        = cfg.optimizer.algo
+    ps          = cfg.optimizer.pop_size
+    ng          = cfg.optimizer.n_gen
+    sd          = cfg.optimizer.seed
+    vb          = cfg.optimizer.verbose
+    show        = cfg.output.show
+    cell_size_m = cfg.cost.cell_size_m
+    tag         = f"[{label}]" if label else ""
+    _csm        = cell_size_m
+
+    obj_str = cfg.optimizer.objective.upper() if cfg.optimizer.objective else "FULL"
+    try:
+        obj = ObjectiveType(obj_str)
+    except ValueError:
+        print(f"[optimizer] Unknown objective '{obj_str}' — defaulting to FULL.")
+        obj = ObjectiveType.FULL
+
+    def _solve(builder, single: bool):
+        a = "GA" if single else algo
+        return (builder
+                .add_restorable_constraint(**cc)
+                .add_budget_constraint(max_cost=cfg.constraints.max_cost)
+                .solve(pop_size=ps, n_gen=ng, seed=sd, verbose=vb, algo=a))
+
+    print(f"\n{tag} --- Objective: {obj.value}  |  Algorithm: {algo} ---")
+
+    plot_cost_surface(
+        data,
+        algo_name=algo,
+        save_path=f"{out_dir}/{pfx}_{algo}_0_cost_surface.png",
+        fig_saved=cfg.output.fig_saved,
+        show=show,
+    )
+
+    def _knee(sols):
+        return _knee_point_3d(sols) if len(sols) > 1 else sols[0]
+
+    if obj == ObjectiveType.MESH:
+        r = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_max_mesh_objective(), True)
+        plot_solution(data, r["solutions"][0],
+                      title=f"Single-objective — Max MESH  {label}",
+                      algo_name=r["algo_name"],
+                      save_path=f"{out_dir}/{pfx}_1_mesh.png",
+                      fig_saved=cfg.output.fig_saved, show=show)
+        _save_pareto_csv(r["solutions"], f"{out_dir}/{pfx}_pareto_mesh.csv",
+                         algo=r["algo_name"], cell_size_m=_csm)
+        _save_pareto_selections(r["solutions"], f"{out_dir}/{pfx}_pareto_mesh_selections.npz")
+        export_raster_mask(data, r["solutions"][0], out_dir=out_dir, pfx=pfx, cfg=cfg,
+                           suffix="best_mesh_mask")
+        _save_results_summary_csv([("MESH", r)], f"{out_dir}/{pfx}_summary.csv", cell_size_m=_csm)
+        return (r,)
+
+    elif obj == ObjectiveType.IIC:
+        r = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_max_iic_objective(), True)
+        plot_solution(data, r["solutions"][0],
+                      title=f"Single-objective — Max IIC  {label}",
+                      algo_name=r["algo_name"],
+                      save_path=f"{out_dir}/{pfx}_2_iic.png",
+                      fig_saved=cfg.output.fig_saved, show=show)
+        _save_pareto_csv(r["solutions"], f"{out_dir}/{pfx}_pareto_iic.csv",
+                         algo=r["algo_name"], cell_size_m=_csm)
+        _save_pareto_selections(r["solutions"], f"{out_dir}/{pfx}_pareto_iic_selections.npz")
+        export_raster_mask(data, r["solutions"][0], out_dir=out_dir, pfx=pfx, cfg=cfg,
+                           suffix="best_iic_mask")
+        _save_results_summary_csv([("IIC", r)], f"{out_dir}/{pfx}_summary.csv", cell_size_m=_csm)
+        return (r,)
+
+    elif obj == ObjectiveType.COST:
+        r = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_min_cost_objective(), True)
+        plot_solution(data, r["solutions"][0],
+                      title=f"Single-objective — Min Cost  {label}",
+                      algo_name=r["algo_name"],
+                      save_path=f"{out_dir}/{pfx}_3_cost.png",
+                      fig_saved=cfg.output.fig_saved, show=show)
+        _save_pareto_csv(r["solutions"], f"{out_dir}/{pfx}_pareto_cost.csv",
+                         algo=r["algo_name"], cell_size_m=_csm)
+        _save_pareto_selections(r["solutions"], f"{out_dir}/{pfx}_pareto_cost_selections.npz")
+        export_raster_mask(data, r["solutions"][0], out_dir=out_dir, pfx=pfx, cfg=cfg,
+                           suffix="best_cost_mask")
+        _save_results_summary_csv([("COST", r)], f"{out_dir}/{pfx}_summary.csv", cell_size_m=_csm)
+        return (r,)
+
+    elif obj == ObjectiveType.MESH_IIC:
+        r = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_mesh_iic_objective(), False)
+        plot_pareto_front(r["solutions"], ObjectiveType.MESH_IIC,
+                          algo_name=r["algo_name"],
+                          save_path=f"{out_dir}/{pfx}_pareto_mesh_iic.png",
+                          fig_saved=cfg.output.fig_saved, show=show)
+        _knee_mi = _knee(r["solutions"])
+        _save_pareto_csv(r["solutions"], f"{out_dir}/{pfx}_pareto_mesh_iic.csv",
+                         hypervolume=r.get("hypervolume", float("nan")),
+                         algo=r["algo_name"], knee_solution=_knee_mi, cell_size_m=_csm)
+        _save_pareto_selections(r["solutions"], f"{out_dir}/{pfx}_pareto_mesh_iic_selections.npz")
+        export_raster_mask(data, _knee_mi, out_dir=out_dir, pfx=pfx, cfg=cfg,
+                           suffix="best_mesh_iic_mask")
+        _save_results_summary_csv([("MESH_IIC", r)], f"{out_dir}/{pfx}_summary.csv", cell_size_m=_csm)
+        return (r,)
+
+    elif obj == ObjectiveType.MESH_COST:
+        r = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_mesh_cost_objective(), False)
+        plot_pareto_front(r["solutions"], ObjectiveType.MESH_COST,
+                          algo_name=r["algo_name"],
+                          save_path=f"{out_dir}/{pfx}_5_pareto_mesh_cost.png",
+                          fig_saved=cfg.output.fig_saved, show=show)
+        _knee_mc = _knee(r["solutions"])
+        _save_pareto_csv(r["solutions"], f"{out_dir}/{pfx}_pareto_mesh_cost.csv",
+                         hypervolume=r.get("hypervolume", float("nan")),
+                         algo=r["algo_name"], knee_solution=_knee_mc, cell_size_m=_csm)
+        _save_pareto_selections(r["solutions"], f"{out_dir}/{pfx}_pareto_mesh_cost_selections.npz")
+        export_raster_mask(data, _knee_mc, out_dir=out_dir, pfx=pfx, cfg=cfg,
+                           suffix="best_mesh_cost_mask")
+        _save_results_summary_csv([("MESH_COST", r)], f"{out_dir}/{pfx}_summary.csv", cell_size_m=_csm)
+        return (r,)
+
+    elif obj == ObjectiveType.IIC_COST:
+        r = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_iic_cost_objective(), False)
+        plot_pareto_front(r["solutions"], ObjectiveType.IIC_COST,
+                          algo_name=r["algo_name"],
+                          save_path=f"{out_dir}/{pfx}_6_pareto_iic_cost.png",
+                          fig_saved=cfg.output.fig_saved, show=show)
+        _knee_ic = _knee(r["solutions"])
+        _save_pareto_csv(r["solutions"], f"{out_dir}/{pfx}_pareto_iic_cost.csv",
+                         hypervolume=r.get("hypervolume", float("nan")),
+                         algo=r["algo_name"], knee_solution=_knee_ic, cell_size_m=_csm)
+        _save_pareto_selections(r["solutions"], f"{out_dir}/{pfx}_pareto_iic_cost_selections.npz")
+        export_raster_mask(data, _knee_ic, out_dir=out_dir, pfx=pfx, cfg=cfg,
+                           suffix="best_iic_cost_mask")
+        _save_results_summary_csv([("IIC_COST", r)], f"{out_dir}/{pfx}_summary.csv", cell_size_m=_csm)
+        return (r,)
+
+    else:  # FULL (default)
+        r = _solve(ForemostProblemBuilder(data, cell_size_m=cell_size_m).set_full_objective(), False)
+        plot_pareto_front_3d(r["solutions"],
+                             algo_name=r["algo_name"],
+                             save_path=f"{out_dir}/{pfx}_7_pareto_3d.png",
+                             fig_saved=cfg.output.fig_saved, show=show)
+        _best = _knee_point_3d(r["solutions"]) if r["solutions"] else None
+        _save_pareto_csv(r["solutions"], f"{out_dir}/{pfx}_pareto_full.csv",
+                         hypervolume=r.get("hypervolume", float("nan")),
+                         algo=r["algo_name"], knee_solution=_best, cell_size_m=_csm)
+        _save_pareto_selections(r["solutions"], f"{out_dir}/{pfx}_pareto_full_selections.npz")
+        if _best is not None:
+            _save_knee_csv(_best, f"{out_dir}/{pfx}_knee_solution.csv",
+                           algo=r["algo_name"], objective="FULL", cell_size_m=_csm)
+            plot_restoration_map(data, _best,
+                                 out_path=f"{out_dir}/{pfx}_best_pareto3d_map.png",
+                                 label=label, algo_name=r["algo_name"],
+                                 bg_alpha=0.30, dpi=cfg.output.dpi, show=show)
+            export_raster_mask(data, _best, out_dir=out_dir, pfx=pfx, cfg=cfg)
+        _save_results_summary_csv([("FULL", r)], f"{out_dir}/{pfx}_summary.csv", cell_size_m=_csm)
+        return (r,)
+
+
 # ── MODE 1: load .npy arrays from folder ──────────────────────────────────────
 
 
 def _run_mode1(cfg: "ForemostConfig") -> tuple:
     """
-    Mode 1 — Load pre-exported ``.npy`` arrays from a folder and run all 7
-    objectives.
+    Mode 1 — Load pre-exported ``.npy`` arrays from a folder and run the
+    objective selected in ``cfg.optimizer.objective``.
 
     Array discovery
     ---------------
@@ -2823,33 +3521,127 @@ def _run_mode1(cfg: "ForemostConfig") -> tuple:
     print(f"  Algorithm : {cfg.optimizer.algo}")
     print("=" * 65)
 
+    # ── Explicit per-array paths (data.*_path) take priority ─────────────────
+    _explicit: dict[str, np.ndarray] = {}
+    _explicit_dirs: list[str] = []
+    for _key, _attr in [("habitat",    "habitat_path"),
+                         ("restorable", "restorable_path"),
+                         ("accessible", "accessible_path"),
+                         ("cost",       "cost_path")]:
+        _p = getattr(cfg.data, _attr, "").strip()
+        if _p and os.path.isfile(_p):
+            _explicit[_key] = np.load(_p)
+            _explicit_dirs.append(os.path.dirname(_p))
+            print(f"  [{_key:>12s}]  ← {os.path.basename(_p)}  (explicit path)")
+
+    # ── Folder-based discovery for any array not given explicitly ─────────────
+    _missing = [k for k in ("habitat", "restorable", "accessible", "cost")
+                if k not in _explicit]
+
     folder = (cfg.data.npy_folder or "").strip()
-    if not folder:
-        print("\n  No npy_folder configured — opening folder picker …")
-        folder = _ask_folder("Select folder containing .npy arrays")
-    if not folder:
-        print("  No folder selected.  Aborting.")
-        return ()
+    if _missing:
+        if not folder:
+            print("\n  No npy_folder configured — opening folder picker …")
+            folder = _ask_folder("Select folder containing .npy arrays")
+        if not folder:
+            print("  No folder selected.  Aborting.")
+            return ()
+        print(f"\n  Loading arrays from: {folder}")
+        _folder_arrays = load_npy_arrays(folder)
+        for _k in _missing:
+            _explicit[_k] = _folder_arrays[_k]
+    arrays = _explicit
 
-    print(f"\n  Loading arrays from: {folder}")
-    arrays = load_npy_arrays(folder)
-
-    # Optional elevation array produced by annotator
+    # ── Elevation: explicit path first, then scan folder ─────────────────────
+    # TIFs are deferred — they require georef for proper resampling to N×N grid.
     elev_arr = None
-    for f in sorted(Path(folder).glob("*.npy")):
-        if "elevation" in f.name.lower():
-            elev_arr = np.load(str(f)).astype(np.float64)
-            print(f"  [   elevation]  ← {f.name}")
-            break
+    _elev_tif_path = ""  # deferred TIF path (resolved after georef is loaded)
+    _elev_path = getattr(cfg.data, "elevation_path", "").strip()
+    if _elev_path and os.path.isfile(_elev_path):
+        _ext = os.path.splitext(_elev_path)[1].lower()
+        if _ext in (".tif", ".tiff"):
+            _elev_tif_path = _elev_path   # defer until georef is known
+            print(f"  [   elevation]  GeoTIFF queued for resampling: {os.path.basename(_elev_path)}")
+        else:
+            elev_arr = np.load(_elev_path).astype(np.float64)
+            print(f"  [   elevation]  ← {os.path.basename(_elev_path)}  (explicit path)")
+    elif folder:
+        for f in sorted(Path(folder).glob("*.npy")):
+            if "elevation" in f.name.lower():
+                elev_arr = np.load(str(f)).astype(np.float64)
+                print(f"  [   elevation]  ← {f.name}")
+                break
 
     for k, v in arrays.items():
+        if not isinstance(v, np.ndarray):
+            continue
         print(
             f"    {k:>12s} : shape={v.shape}  dtype={v.dtype}  "
             f"min={float(v.min()):.3g}  max={float(v.max()):.3g}"
         )
 
+    # Load session JSON for exact georef (exported by QGIS plugin alongside .npy)
+    import json as _json
+    georef = None
+    _search_dirs = ([Path(folder)] if folder else []) + [Path(d) for d in _explicit_dirs]
+    _seen_dirs: set[str] = set()
+    for _sf in (f for d in _search_dirs
+                if str(d) not in _seen_dirs and not _seen_dirs.add(str(d))
+                for f in sorted(d.glob("*session*N*.json"))):
+        try:
+            _gref = _json.loads(_sf.read_text(encoding="utf-8")).get("georef")
+            if _gref and len(_gref.get("extent", [])) == 4:
+                georef = _gref
+                print(f"  [georef] {_sf.name}  →  extent={_gref['extent']}  crs={_gref.get('crs','?')}")
+                break
+        except Exception as _e:
+            print(f"  [georef] Could not read {_sf.name}: {_e}")
+    if georef is None:
+        print("  [georef] No session JSON found — GeoTIFF will fall back to elevation raster bounds.")
+
     data = _arrays_to_habitatdata(arrays, cell_area=cfg.data.cell_area)
-    if elev_arr is not None:
+    if georef is not None:
+        data.georef = georef
+    # ── Attach elevation (npy: direct; TIF: reproject to grid) ──────────────
+    if _elev_tif_path:
+        try:
+            import rasterio as _rio
+            import rasterio.warp as _warp
+            from rasterio.enums import Resampling as _Resamp
+            from rasterio.transform import from_bounds as _from_bounds
+            _nrows, _ncols = data.shape
+            with _rio.open(_elev_tif_path) as _src:
+                if georef and len(georef.get("extent", [])) == 4:
+                    _minx, _miny, _maxx, _maxy = georef["extent"]
+                    _grid_crs = georef.get("crs", "EPSG:3857")
+                    _dst_transform = _from_bounds(_minx, _miny, _maxx, _maxy, _ncols, _nrows)
+                    _elev_grid = np.zeros((_nrows, _ncols), dtype=np.float64)
+                    _warp.reproject(
+                        source=_rio.band(_src, 1),
+                        destination=_elev_grid,
+                        src_transform=_src.transform,
+                        src_crs=_src.crs,
+                        dst_transform=_dst_transform,
+                        dst_crs=_grid_crs,
+                        resampling=_Resamp.average,
+                        src_nodata=float("nan"),
+                        dst_nodata=0.0,
+                    )
+                    np.nan_to_num(_elev_grid, copy=False)
+                else:
+                    # No georef: block-average the full raster down to N×N
+                    _raw = _src.read(1, masked=True).filled(0.0).astype(np.float64)
+                    from scipy.ndimage import zoom as _zoom
+                    _elev_grid = _zoom(_raw, (_nrows / _raw.shape[0], _ncols / _raw.shape[1]))
+            data.elevation = _elev_grid
+            print(
+                f"  Elevation TIF resampled → {_nrows}×{_ncols}  "
+                f"min={_elev_grid.min():.1f}m  max={_elev_grid.max():.1f}m"
+            )
+        except Exception as _e:
+            print(f"  [elevation TIF] reproject failed: {_e} — skipped")
+
+    elif elev_arr is not None:
         try:
             if elev_arr.shape == data.shape:
                 data.elevation = elev_arr
@@ -2867,16 +3659,45 @@ def _run_mode1(cfg: "ForemostConfig") -> tuple:
     print(f"  Candidate cells : {cands.sum()}")
     if cands.any():
         print(
-            f"  Cost range (€)  : "
+            f"  Cost range ($)  : "
             f"{data.cost[cands].min():.1f} – {data.cost[cands].max():.1f}"
         )
 
     out_dir = cfg.output.dir
     os.makedirs(out_dir, exist_ok=True)
-    pfx = cfg.output.prefix
 
-    results = _run_all_objectives(data, cfg, out_dir, pfx, label="mode=1")
-    print(f"\n  Mode 1 complete — outputs saved to {out_dir}/")
+    # Derive prefix and label from the cost npy filename stem
+    matched = arrays.get("_matched_files", {})
+    if "cost" in matched:
+        pfx = matched["cost"].stem   # e.g. LANDUSE_corrected_APP_rivers_2_cost_N100
+        # Extract "N100" grid-size tag and base dataset name for figure titles
+        _m = re.search(r"_N(\d+)$", pfx)
+        if _m:
+            _n_tag   = f"N={_m.group(1)}"
+            _base    = re.sub(r"_cost_N\d+$|_N\d+$", "", pfx)
+            label    = f"{_base}  ·  {_n_tag}"
+        else:
+            label = pfx
+    else:
+        pfx   = cfg.output.prefix
+        label = "mode=1"
+
+    # Support running multiple objectives in sequence.
+    # cfg.optimizer.objectives (list) takes priority over cfg.optimizer.objective.
+    objectives = list(getattr(cfg.optimizer, "objectives", None) or [])
+    if not objectives:
+        objectives = [cfg.optimizer.objective or "FULL"]
+
+    all_results = []
+    for obj_str in objectives:
+        cfg.optimizer.objective = obj_str.upper()
+        print(f"\n{'='*60}\n  Objective: {cfg.optimizer.objective}\n{'='*60}")
+        all_results.append(
+            _run_selected_objective(data, cfg, out_dir, pfx, label=label)
+        )
+
+    print(f"\n  Mode 1 complete ({len(objectives)} objective(s)) — outputs saved to {out_dir}/")
+    results = tuple(r for group in all_results for r in group)
     return results
 
 

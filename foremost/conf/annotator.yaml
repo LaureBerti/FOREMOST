@@ -3,40 +3,42 @@
 # ──────────────────────────────────────────────────────────────────────────
 
 data:
-  image_path: ""       # path to PNG/JPG/GeoTIFF, or leave empty for file picker
-  gpkg_path:  "./input/PEC/PEC_corrected.gpkg"       # path to GeoPackage
+  image_path: "./input/PEC/Final/LANDUSE_corrected_APP_rivers_2.tif"   # path to PNG/JPG/GeoTIFF
+  gpkg_path:  ""       # path to GeoPackage (.gpkg/.shp/.geojson)
   layer:      ""       # GPKG layer name (empty = first layer)
-  N:          30             # grid size N×N
+  N:          100             # grid size N×N
 
 layers:
   elevation:
     enabled:   true
-    path:      "./input/PEC/ELEVATION_corrected.tif"
+    path:      "./input/PEC/Final/ELEVATION_corrected.tif"
     alpha:     0.35
     colormap:  "plasma"
   roads:
     enabled:   false
-    path:      "./input/PEC/ROADS_corrected.gpkg" #   path to shapefile/GPKG (empty = fetch from OSM)
+    path:      "./input/PEC/Final/ROADS_corrected.gpkg"
     alpha:     0.65
     color:     "#e63946"
     linewidth: 1.6
   cadastral:
     enabled:   false
-    path:      ""      # path to cadastral shapefile/GPKG
+    path:      "./input/PEC/Final/CAR_corrected.gpkg"      # path to cadastral shapefile/GPKG
     alpha:     0.5
     color:     "#f4a261"
     facecolor: "#f4a26118"
     linewidth: 0.8
   hydrology:
     enabled:   false
-    path:      ""      # path to shapefile/GPKG (empty = fetch waterways from OSM)
+    path:      "./input/PEC/Final/RIVERS_corrected.gpkg"      # path to shapefile/GPKG (empty = fetch waterways from OSM)
     alpha:     0.65
     color:     "#4cc9f0"
     linewidth: 1.4
 
 cost:
-  default_cost: 100.0    # € per cell applied to CLASS_RA cells with no cost
-  auto_fill:    true     # fill missing costs automatically on export
+  default_cost:   100.0  # $ per cell applied to CLASS_RA cells with no cost
+  auto_fill:      true   # fill missing costs automatically on export
+  tree_unit_cost: 15.0   # B$ per planted tree
+  tree_spacing_m: 2.5    # metres between trees (2–3 m → 1200–1700 trees/ha)
   # Slope-based accessibility filter applied at export time.
   # Cells where the 75th-percentile terrain slope (computed at native DEM
   # resolution, aggregated per planning unit) exceeds max_slope_deg are
@@ -45,11 +47,11 @@ cost:
 
 ui:
   canvas_size:        800
-  max_zoom:           16.0
+  max_zoom:           30.0
   pan_key_step:       40
   auto_hab_threshold: 0.95
   auto_label_threshold: 50
-  panel_width:        310
+  panel_width:        400
 
 output:
   folder: ""

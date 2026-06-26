@@ -89,10 +89,17 @@ import numpy as np
  
 # ── PIL ────────────────────────────────────────────────────────────────────────
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageTk
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     print("ERROR: Pillow is required.  pip install pillow")
     sys.exit(1)
+# ImageTk requires tkinter (GUI only) — imported lazily to allow headless use
+try:
+    from PIL import ImageTk
+    _HAS_IMAGETK = True
+except ImportError:
+    ImageTk = None  # type: ignore[assignment]
+    _HAS_IMAGETK = False
  
 # ── tkinter ────────────────────────────────────────────────────────────────────
 try:

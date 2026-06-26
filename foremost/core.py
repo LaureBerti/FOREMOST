@@ -101,7 +101,11 @@ import matplotlib.patches as mpatches
 
 # from matplotlib.colors import Normalize
 import networkx as nx
-from scipy.ndimage import label as ndimage_label, generate_binary_structure, distance_transform_edt
+from scipy.ndimage import (
+    label as ndimage_label, generate_binary_structure,
+    distance_transform_edt, distance_transform_cdt, binary_erosion,
+)
+from scipy.spatial import cKDTree as _cKDTree
 
 # ── pymoo core (required) ─────────────────────────────────────────────────────
 from pymoo.algorithms.moo.nsga2 import NSGA2
@@ -161,6 +165,27 @@ _C = dict(
 SUPPORTED_ALGOS = ("GA", "NSGA2", "NSGA3", "CTAEA", "RNSGA3")
 
 
+def _cost_scale_formatter(values):
+    """Shared-scale axis formatter for a collection of cost values.
+
+    Returns (FuncFormatter, label_suffix) where:
+      - FuncFormatter shows the mantissa only (e.g. '9,750') using a common
+        power-of-10 scale anchored on min(values), so the smallest tick has
+        a mantissa in [1, 10) and all ticks share the same exponent.
+      - label_suffix e.g. ' (× 10¹⁰ B$)' belongs once in the axis/colorbar label.
+    """
+    import math as _math
+    finite = [abs(v) for v in values if v == v and abs(v) < float("inf") and abs(v) > 0]
+    if not finite:
+        return plt.FuncFormatter(lambda v, _: "0"), " (B$)"
+    exp = int(_math.floor(_math.log10(min(finite))))
+    scale = 10 ** exp
+    sup = str(exp).translate(str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻"))
+    label_suffix = f" (× 10{sup} B$)"
+    fmt = plt.FuncFormatter(lambda v, _: f"{v / scale:.3f}".replace(".", ","))
+    return fmt, label_suffix
+
+
 # =============================================================================
 # 0.  HYDRA CONFIGURATION
 # =============================================================================
@@ -213,6 +238,15 @@ class ConstraintsConfig:
     max_cost: float = float("inf")
     min_app_compliance: float = 0.0   # fraction of restored cells in APPs (Forest Code Art. 61-A)
     max_slope_deg: float = float("inf")  # max terrain slope for restoration (degrees)
+    # NC constraints (disabled by default)
+    min_patch_size: int = 0           # min cells per restored CC (NC1)
+    max_edge_ratio: float = 1.0       # max fraction of edge cells (NC2)
+    min_iic_delta: float = 0.0        # min IIC gain over baseline (NC3)
+    max_distance_to_habitat: int = 0  # max Chebyshev distance to habitat (NC4, 0=disabled)
+    min_carbon_stock: float = 0.0     # min carbon stock tCO2 (NC7)
+    carbon_rate_tco2_ha_yr: float = 3.0
+    carbon_horizon_yr: int = 20
+    min_corridor_width: int = 0       # min corridor width in cells (NC8, 0-1=disabled)
 
 
 @dataclass
@@ -850,7 +884,9 @@ _CONN8 = generate_binary_structure(2, 2)
 def compute_patches(habitat_grid: np.ndarray) -> tuple:
     """8-connected patch labelling. Returns (labeled, n_patches, areas_cells)."""
     labeled, n = ndimage_label(habitat_grid == 1, structure=_CONN8)
-    areas = np.array([(labeled == p).sum() for p in range(1, n + 1)])
+    if n == 0:
+        return labeled, n, np.array([], dtype=np.int64)
+    _, areas = np.unique(labeled[labeled > 0], return_counts=True)
     return labeled, n, areas
 
 
@@ -902,30 +938,33 @@ def iic(
         return 0.0
     A_L = total_cells * cell_area
     a = areas * cell_area
+
+    # Build patch connectivity graph via KDTree (Chebyshev / L-inf metric).
+    # Single query over all habitat cells — O(m log m) vs O(n² × m²).
     G = nx.Graph()
     G.add_nodes_from(range(n))
-    # Precompute patch cell coordinates
-    coords = [np.argwhere(labeled == p + 1) for p in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            # Chebyshev distance between all pairs of cells
-            d = np.abs(coords[i][:, None, :] - coords[j][None, :, :]).max(axis=2)
-            if d.min() <= max_dist:
-                G.add_edge(i, j)
-    # IIC numerator
-    num = 0.0
-    for i in range(n):
-        for j in range(n):
-            nl = (
-                0
-                if i == j
-                else (
-                    nx.shortest_path_length(G, i, j) if nx.has_path(G, i, j) else None
-                )
-            )
-            if nl is not None:
-                num += (a[i] * a[j]) / (1 + nl)
-    return float(num / (A_L**2))
+    all_coords = np.argwhere(labeled > 0)
+    all_labels = labeled[all_coords[:, 0], all_coords[:, 1]]
+    tree = _cKDTree(all_coords)
+    neighbor_lists = tree.query_ball_tree(tree, r=max_dist, p=np.inf)
+    for idx, nbrs in enumerate(neighbor_lists):
+        li = int(all_labels[idx])
+        for ni in nbrs:
+            lj = int(all_labels[ni])
+            if lj > li:
+                G.add_edge(li - 1, lj - 1)
+
+    # All-pairs shortest path lengths via single BFS sweep, then vectorised sum.
+    spl = dict(nx.all_pairs_shortest_path_length(G))
+    NL = np.full((n, n), np.inf)
+    for src, dsts in spl.items():
+        for dst, length in dsts.items():
+            NL[src, dst] = length
+
+    finite = np.isfinite(NL)
+    ai_aj = a[:, None] * a[None, :]
+    num = float(np.sum(ai_aj[finite] / (1.0 + NL[finite])))
+    return float(num / (A_L ** 2))
 
 
 # =============================================================================
@@ -1043,8 +1082,16 @@ class RestorationConstraints:
     max_nb_cc: int = 9999
     min_proportion: float = 0.0
     max_cost: float = float("inf")
-    min_app_compliance: float = 0.0   # fraction of restored cells in APPs (Forest Code Art. 61-A)
-    max_slope_deg: float = float("inf")  # max terrain slope for restoration (degrees)
+    min_app_compliance: float = 0.0
+    max_slope_deg: float = float("inf")
+    min_patch_size: int = 0
+    max_edge_ratio: float = 1.0
+    min_iic_delta: float = 0.0
+    max_distance_to_habitat: int = 0
+    min_carbon_stock: float = 0.0
+    carbon_rate_tco2_ha_yr: float = 3.0
+    carbon_horizon_yr: int = 20
+    min_corridor_width: int = 0
 
     @classmethod
     def from_config(cls, cfg: ConstraintsConfig) -> "RestorationConstraints":
@@ -1109,6 +1156,25 @@ class RestorationProblem(ElementwiseProblem):
         self.total_area_cells = int((data.habitat != data.nodata_value).sum())
         cand_costs = data.cost[cr, cc]
         self._cost_scale = float(cand_costs.sum()) or 1.0
+
+        # ── NC constraint precomputation ────────────────────────────────────
+        # Chebyshev distance from every cell to nearest habitat cell (NC4).
+        # Computed once; free if constraint is disabled (max_distance_to_habitat==0).
+        if constraints.max_distance_to_habitat > 0:
+            non_hab = (data.habitat != 1).astype(np.uint8)
+            self._dist_to_habitat = distance_transform_cdt(
+                non_hab, metric="chessboard"
+            ).astype(np.int32)
+        else:
+            self._dist_to_habitat = None
+
+        # Baseline IIC (habitat only, no restoration) for NC3 (min_iic_delta).
+        if constraints.min_iic_delta > 0.0:
+            self._baseline_iic = iic(
+                data.habitat, self.total_area_cells, data.cell_area, iic_max_dist
+            )
+        else:
+            self._baseline_iic = 0.0
 
         super().__init__(
             n_var=self.n_candidates,
@@ -1200,6 +1266,92 @@ class RestorationProblem(ElementwiseProblem):
                 excess = np.maximum(0.0, sel_slopes - c.max_slope_deg)
                 if excess.any():
                     v += float((excess ** 2).sum())
+
+        # ── NC constraints (7–12) ──────────────────────────────────────────
+        # Build selection grid once for all spatial NC checks.
+        nc_needs_sg = (
+            c.min_patch_size > 0 or
+            c.max_edge_ratio < 1.0 or
+            c.min_corridor_width > 1
+        )
+        sg_nc = self._build_selection_grid(x) if (nc_needs_sg and sel.any()) else None
+
+        # ---- 7. Minimum patch size (NC1) ----------------------------
+        # Every restored connected component must contain at least
+        # min_patch_size cells; penalize each undersized CC.
+        if c.min_patch_size > 0 and sel.any():
+            labels_nc, n_cc_nc = connected_components(sg_nc)
+            for lbl in range(1, n_cc_nc + 1):
+                cc_size = int((labels_nc == lbl).sum())
+                if cc_size < c.min_patch_size:
+                    v += (c.min_patch_size - cc_size) ** 2
+
+        # ---- 8. Maximum edge ratio (NC2) ----------------------------
+        # Edge cell: selected cell with at least one unselected 4-neighbour.
+        # Penalize if (n_edge / n_selected) > max_edge_ratio.
+        if c.max_edge_ratio < 1.0 and sel.any():
+            n_sel = int(sel.sum())
+            padded = np.pad(sg_nc, 1, mode="constant", constant_values=0)
+            interior = (
+                (padded[1:-1, 1:-1] == 1) &
+                (padded[:-2,  1:-1] == 1) &
+                (padded[2:,   1:-1] == 1) &
+                (padded[1:-1, :-2]  == 1) &
+                (padded[1:-1, 2:]   == 1)
+            )
+            n_edge = n_sel - int(interior.sum())
+            ratio = n_edge / n_sel
+            if ratio > c.max_edge_ratio:
+                v += (ratio - c.max_edge_ratio) ** 2
+
+        # ---- 9. Minimum IIC delta (NC3) ----------------------------
+        # Restored landscape IIC must exceed baseline by min_iic_delta.
+        if c.min_iic_delta > 0.0 and sel.any():
+            hg_nc = self._build_habitat_grid(x)
+            current_iic = iic(
+                hg_nc, self.total_area_cells,
+                self.habitat_data.cell_area, self.iic_max_dist,
+            )
+            delta = current_iic - self._baseline_iic
+            if delta < c.min_iic_delta:
+                v += (c.min_iic_delta - delta) ** 2
+
+        # ---- 10. Maximum distance to existing habitat (NC4) ----------
+        # No restored cell may be farther than max_distance_to_habitat
+        # cells (Chebyshev) from the nearest existing habitat cell.
+        if c.max_distance_to_habitat > 0 and sel.any() and self._dist_to_habitat is not None:
+            dists = self._dist_to_habitat[
+                self._candidate_rows[sel], self._candidate_cols[sel]
+            ]
+            max_d = int(dists.max())
+            if max_d > c.max_distance_to_habitat:
+                v += (max_d - c.max_distance_to_habitat) ** 2
+
+        # ---- 11. Minimum carbon stock (NC7) -------------------------
+        # Estimated sequestration = n_cells × cell_area_ha × rate × horizon.
+        if c.min_carbon_stock > 0.0 and sel.any():
+            cell_area_ha = (self.cell_size_m ** 2) / 10_000.0
+            carbon = (
+                int(sel.sum()) *
+                cell_area_ha *
+                c.carbon_rate_tco2_ha_yr *
+                c.carbon_horizon_yr
+            )
+            if carbon < c.min_carbon_stock:
+                v += ((c.min_carbon_stock - carbon) / max(c.min_carbon_stock, 1.0)) ** 2
+
+        # ---- 12. Minimum corridor width (NC8) -----------------------
+        # Erode the restored selection by floor(width/2) steps; if the number
+        # of connected components increases, a corridor narrower than
+        # min_corridor_width exists.
+        if c.min_corridor_width > 1 and sel.any():
+            n_cc_before = connected_components(sg_nc)[1]
+            n_erode = c.min_corridor_width // 2
+            eroded = binary_erosion(sg_nc.astype(bool), iterations=n_erode)
+            if eroded.any():
+                n_cc_after = connected_components(eroded.astype(np.int32))[1]
+                if n_cc_after > n_cc_before:
+                    v += (n_cc_after - n_cc_before) ** 2
 
         return v
 
@@ -1354,7 +1506,12 @@ def _build_algorithm(
         if n_obj < 2:
             warnings.warn("CTAEA is multi-objective; using NSGA2 for Single-objective.")
             return NSGA2(**common)
-        n_part = max(4, pop_size // (n_obj * 3))
+        # Cap n_part at 12 (≤91 ref_dirs for 3-obj).  CTAEA's _updateDA uses
+        # NonDominatedSorting inside a nested loop over ref_dirs; when all
+        # individuals are infeasible with similar F values they collapse to one
+        # niche, making the loop O(n³).  n_part≥16 (153 ref_dirs) causes
+        # hours-long Gen-1 stalls on warm-start runs.
+        n_part = max(4, min(pop_size // (n_obj * 3), 12))
         ref_dirs = get_reference_directions("das-dennis", n_obj, n_partitions=n_part)
         # CTAEA needs ref_dirs; does NOT accept eliminate_duplicates or pop_size
         common_ctaea = {k: v for k, v in common.items()
@@ -1399,6 +1556,7 @@ def solve(
     seed: int = 42,
     verbose: bool = True,
     algo_name: str = "NSGA2",
+    initial_pop: "np.ndarray | None" = None,
 ) -> dict:
     """
     Run the evolutionary optimisation.
@@ -1427,7 +1585,25 @@ def solve(
         )
         algo_name = "GA"
 
-    sampling = BinaryRandomSampling()
+    if initial_pop is not None:
+        from pymoo.core.population import Population as _Population
+        n_warm = initial_pop.shape[0]
+        # Pad with random individuals if warm-start pool is smaller than pop_size
+        if n_warm < pop_size:
+            rng = np.random.default_rng(seed)
+            n_rand = pop_size - n_warm
+            cand_mask = problem.habitat_data.candidate_mask
+            n_c = int(cand_mask.sum())
+            rand_X = rng.integers(0, 2, size=(n_rand, n_c), dtype=np.int32)
+            X_init = np.vstack([initial_pop[:, :n_c], rand_X])
+        else:
+            X_init = initial_pop[:pop_size, :problem.n_var]
+        sampling = _Population.new("X", X_init.astype(bool))
+        if verbose:
+            print(f"  [warm-start] seeding {min(n_warm, pop_size)} / {pop_size} "
+                  f"individuals from N100 Pareto front")
+    else:
+        sampling = BinaryRandomSampling()
     crossover = TwoPointCrossover()
     mutation = BitflipMutation(prob=max(1.0 / problem.n_var, 0.01))
     termination = get_termination("n_gen", n_gen)
@@ -1864,8 +2040,16 @@ def plot_pareto_front(
         alpha=0.85,
         zorder=3,
     )
-    cb = plt.colorbar(sc, ax=ax, label="Total restoration cost")
+    _cfmt, _csuffix = _cost_scale_formatter(costs)
+    cb = plt.colorbar(sc, ax=ax, label=f"Total restoration cost{_csuffix}")
     cb.ax.yaxis.label.set_fontsize(10)
+    cb.ax.yaxis.set_major_formatter(_cfmt)
+    if "cost" in xl.lower():
+        ax.xaxis.set_major_formatter(_cfmt)
+        xl = f"Total cost{_csuffix}"
+    if "cost" in yl.lower():
+        ax.yaxis.set_major_formatter(_cfmt)
+        yl = f"Total cost{_csuffix}"
     ax.set_xlabel(xl, fontsize=12)
     ax.set_ylabel(yl, fontsize=12)
     ax.set_title(
@@ -1878,19 +2062,27 @@ def plot_pareto_front(
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.set_facecolor("#fafafa")
 
-    # Annotate extremes
-    for idx, lbl in [
-        (np.argmin(xv) if not inv_x else np.argmax(xv), f"Best\n{xl}"),
-        (np.argmax(yv) if inv_y else np.argmin(yv), f"Best\n{yl}"),
-    ]:
+    # Annotate extremes — alternate quadrants so labels never overlap
+    _short = lambda s: s.split("(")[0].strip()   # drop "(× 10^N B$)" from axis label
+    _extremes = [
+        (np.argmin(xv) if not inv_x else np.argmax(xv), f"Best {_short(xl)}", ( 50,  28)),
+        (np.argmax(yv) if inv_y else np.argmin(yv),      f"Best {_short(yl)}", (-60, -36)),
+    ]
+    _seen = set()
+    for idx, lbl, xytext in _extremes:
+        pt = (round(xv[idx], 6), round(yv[idx], 6))
+        if pt in _seen:
+            continue          # skip duplicate when both extremes are the same solution
+        _seen.add(pt)
         ax.annotate(
             lbl,
             xy=(xv[idx], yv[idx]),
-            xytext=(12, 12),
+            xytext=xytext,
             textcoords="offset points",
             fontsize=8,
             color=_C["accent"],
             arrowprops=dict(arrowstyle="->", color=_C["accent"], lw=1.2),
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7),
         )
 
     plt.tight_layout()
@@ -1932,10 +2124,13 @@ def plot_pareto_front_3d(
         linewidths=0.3,
         alpha=0.8,
     )
-    plt.colorbar(sc, ax=ax, label="Total cost", shrink=0.6, pad=0.1)
+    _cfmt3d, _csuffix3d = _cost_scale_formatter(cost_v)
+    cb3d = plt.colorbar(sc, ax=ax, label=f"Total cost{_csuffix3d}", shrink=0.6, pad=0.1)
+    cb3d.ax.yaxis.set_major_formatter(_cfmt3d)
     ax.set_xlabel("MESH", fontsize=10, labelpad=8)
     ax.set_ylabel("IIC", fontsize=10, labelpad=8)
-    ax.set_zlabel("Total cost", fontsize=10, labelpad=8)
+    ax.set_zlabel(f"Total cost{_csuffix3d}", fontsize=10, labelpad=8)
+    ax.zaxis.set_major_formatter(_cfmt3d)
     ax.set_title(
         f"3-D Pareto front — FULL{algo_tag}\n"
         f"({len(solutions)} non-dominated solutions)",
@@ -2412,24 +2607,32 @@ def load_habitatdata_from_npy(npy_dir: str = "outputs/", cell_area: float = 1.0)
 
 def _save_pareto_csv(solutions: list, csv_path: str,
                      hypervolume: float = float("nan"),
-                     algo: str = "") -> None:
+                     algo: str = "",
+                     cell_size_m: float = 0.0) -> None:
     """Save FULL Pareto front solutions to a CSV for downstream analysis.
 
-    Columns: cost, mesh, iic, n_cells, total_area
+    Columns: cost, cost_per_ha, mesh, iic, n_cells, total_area
+    cost_per_ha = total_cost / (n_cells × cell_size_m² / 10 000).
     A header comment line records the algo name and HV value.
     """
     import csv as _csv
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     with open(csv_path, "w", newline="") as fh:
         writer = _csv.writer(fh)
-        writer.writerow([f"# algo={algo}  hypervolume={hypervolume:.6f}"])
-        writer.writerow(["cost", "mesh", "iic", "n_cells", "total_area"])
+        writer.writerow([f"# algo={algo}  hypervolume={hypervolume:.6f}"
+                         f"  cell_size_m={cell_size_m:.2f}"])
+        writer.writerow(["cost", "cost_per_ha", "mesh", "iic", "n_cells", "total_area"])
         for s in solutions:
+            n_cells = int(s.get("n_restored_cells", 0))
+            cost    = s.get("total_cost", 0.0)
+            phys_ha = n_cells * cell_size_m ** 2 / 1e4 if cell_size_m > 0 else 0.0
+            cost_per_ha = cost / phys_ha if phys_ha > 0 else float("nan")
             writer.writerow([
-                f"{s.get('total_cost', 0.0):.4f}",
+                f"{cost:.4f}",
+                f"{cost_per_ha:.4f}" if cost_per_ha == cost_per_ha else "nan",
                 f"{s.get('mesh', 0.0):.6f}",
                 f"{s.get('iic', 0.0):.8f}",
-                int(s.get("n_restored_cells", 0)),
+                n_cells,
                 f"{s.get('total_restored_area', 0.0):.4f}",
             ])
     print(f"[csv] Pareto front saved: {csv_path}  ({len(solutions)} solutions)")
@@ -2591,7 +2794,8 @@ def _run_all_objectives(
     # ── Export FULL Pareto front to CSV for downstream analysis ───────────────
     _save_pareto_csv(r_full["solutions"], f"{out_dir}/{pfx}_pareto.csv",
                      hypervolume=r_full.get("hypervolume", float("nan")),
-                     algo=r_full["algo_name"])
+                     algo=r_full["algo_name"],
+                     cell_size_m=cfg.cost.cell_size_m)
 
     print(f"\n  Demo complete — outputs saved to {out_dir}/")
     return r_mesh, r_iic, r_cost, r_mc, r_ic, r_full
