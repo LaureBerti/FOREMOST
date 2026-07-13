@@ -112,6 +112,10 @@ ENV/
 # appveyor
 .appveyor.yml
 
+# Claude Code internal files
+CLAUDE.md
+.claude/
+
 # IDE
 .idea/
 .vscode/
