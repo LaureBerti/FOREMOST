@@ -348,3 +348,9 @@ A paper describing FOREMOST is currently under submission to *Environmental Mode
 You can also cite the QGIS Plugin archived code release:
 
 Archived code (Zenodo): <https://doi.org/10.5281/zenodo.20921038>
+
+---
+
+## Acknowledgements
+
+This research was funded by [IRD](https://www.ird.fr) (Institut de Recherche pour le Développement) and the IJL [IDEAL](https://ideal.ufpb.br/) laboratory (Universidade Federal da Paraíba, Brazil).
