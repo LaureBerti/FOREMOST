@@ -327,13 +327,15 @@ foremost/
 
 ## Citing this work
 
-If you use FOREMOST in your research, please cite:
+A paper describing FOREMOST is currently under submission to *Environmental Modelling & Software*:
 
 > Berti-Equille, L., Saraiva-Maia, J. J., Guérin, J., Cordeiro Estrela, P., Almeida, N., Dutra, M., Romano, V., & Raimundo, R. L. G. (2026).
 > **Forest Restoration Scenarios of Brazil's Atlantic Forest with Constrained Multi-Objective Optimisation.**
-> *Environmental Modelling & Software*. <https://doi.org/10.5281/zenodo.20921038>
+> *Environmental Modelling & Software* (under submission).
 
-Archived code release (Zenodo): <https://doi.org/10.5281/zenodo.20921038>
+In the meantime, please cite the archived code release:
+
+Archived code (Zenodo): <https://doi.org/10.5281/zenodo.20921038>
 
 ## Reference
 
