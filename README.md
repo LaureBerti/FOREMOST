@@ -320,10 +320,22 @@ foremost/
 ├── tests/                  # pytest test suite (36 tests)
 ├── docs/                   # MkDocs documentation source
 ├── conf/                   # project-level Hydra config overrides
-├── input/                  # geospatial input data (GeoTIFF / GPKG)
+├── input/                  # geospatial input data (GeoTIFF / GPKG) — see Data below
 ├── outputs/                # generated figures and arrays
 └── pyproject.toml
 ```
+
+## Data
+
+The annotated geospatial input files (GeoPackage `.gpkg` and GeoTIFF `.tif`) for the
+Pernambuco Endemism Centre (PEC) case study are available on Google Drive:
+
+**[Download PEC input data](https://drive.google.com/drive/folders/1VEEAgIa_tUTbVy3nj2Yk2WRZ7CIADRFN?usp=sharing)**
+
+Place the downloaded files under `input/PEC/` before running mode 1 or mode 2.
+The `.npy` annotation arrays (exported by the annotation tool) are included in `outputs/sessions/`.
+
+---
 
 ## Citing this work
 
