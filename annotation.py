@@ -90,10 +90,17 @@ import numpy as np
  
 # ── PIL ────────────────────────────────────────────────────────────────────────
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageTk
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     print("ERROR: Pillow is required.  pip install pillow")
     sys.exit(1)
+# ImageTk requires tkinter (GUI only) — imported lazily to allow headless use
+try:
+    from PIL import ImageTk
+    _HAS_IMAGETK = True
+except ImportError:
+    ImageTk = None  # type: ignore[assignment]
+    _HAS_IMAGETK = False
  
 # ── tkinter ────────────────────────────────────────────────────────────────────
 try:
@@ -2377,6 +2384,13 @@ class GridRenderer:
     def zoom_out(self): self.zoom_at(1/ZOOM_STEP, self.canvas_size/2, self.canvas_size/2)
     def reset_zoom(self):
         self._zoom = 1.0; self._pan_x = 0.0; self._pan_y = 0.0
+
+    def recenter(self):
+        """Pan so the canvas shows the centre of the image at the current zoom."""
+        vis = self._visible_size()
+        mid = max(0.0, (self._orig_size - vis) / 2)
+        self._pan_x = mid
+        self._pan_y = mid
  
     def pan(self, dx: float, dy: float):
         opp = self._visible_size() / self.canvas_size
@@ -3060,7 +3074,7 @@ class Annotator(tk.Tk):
                  font=FONT_MONO, width=6, bg="white", fg="black",
                  insertbackground="black", relief=tk.FLAT, bd=3,
                  ).pack(side=tk.LEFT, padx=(2, 6))
-        tk.Label(row2, text="cell:", font=FONT_SMALL,
+        tk.Label(row2, text="cell side:", font=FONT_SMALL,
                  fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT)
         self._cell_size_label = tk.Label(row2, textvariable=self._cell_size_var,
                  font=FONT_MONO, fg=FG_DIM, bg=BG_DARK)
@@ -3199,16 +3213,14 @@ class Annotator(tk.Tk):
     def _do_zoom_reset(self): self._renderer.reset_zoom(); self._post_zoom()
 
     def _set_zoom_preset(self):
-        """Apply the zoom level chosen from the preset dropdown."""
+        """Apply the zoom level chosen from the preset dropdown and recenter."""
         try:
             pct = int(self._zoom_combo_var.get().rstrip(" %"))
         except ValueError:
             return
-        factor = pct / 100.0
-        factor = max(MIN_ZOOM, min(MAX_ZOOM, factor))
+        factor = max(MIN_ZOOM, min(MAX_ZOOM, pct / 100.0))
         self._renderer._zoom = factor
-        self._renderer._pan_x = 0.0
-        self._renderer._pan_y = 0.0
+        self._renderer.recenter()
         self._post_zoom()
  
     def _on_mousewheel(self, event):
@@ -3721,24 +3733,26 @@ class Annotator(tk.Tk):
         spacing_m           = getattr(cfg, "tree_spacing_m",        2.5)
         elev_base_m         = getattr(cfg, "elevation_base_m",      0.0)
         elev_slope          = getattr(cfg, "elevation_slope",        0.005)
-        road_penalty_slope  = getattr(cfg, "road_penalty_slope",    0.0002)
-        water_penalty_slope = getattr(cfg, "water_penalty_slope",   0.0001)
-        road_ref_dist_m     = getattr(cfg, "road_ref_dist_m",       500.0)
-        water_ref_dist_m    = getattr(cfg, "water_ref_dist_m",      200.0)
-        noise_sigma         = getattr(cfg, "noise_sigma",            0.05)
+        road_penalty_slope  = getattr(cfg, "road_penalty_slope",       0.0002)
+        water_penalty_slope = getattr(cfg, "water_penalty_slope",      0.0001)
+        road_ref_dist_m     = getattr(cfg, "road_ref_dist_m",          500.0)
+        water_ref_dist_m    = getattr(cfg, "water_ref_dist_m",         200.0)
+        inacc_surcharge     = getattr(cfg, "inaccessible_surcharge",   0.40)
+        noise_sigma         = getattr(cfg, "noise_sigma",               0.05)
 
         n_trees   = (cell_size_m ** 2) / max(spacing_m ** 2, 1e-9)
         base_cost = n_trees * tree_unit_cost
 
-        elev_factor  = 1.0 + elev_slope * np.maximum(0.0, elev_m - elev_base_m)
-        road_factor  = 1.0 + road_penalty_slope  * np.maximum(0.0, dist_road  - road_ref_dist_m)
-        water_factor = 1.0 + water_penalty_slope * np.maximum(0.0, dist_water - water_ref_dist_m)
+        access_factor = np.where(dist_road <= road_ref_dist_m, 1.0, 1.0 + inacc_surcharge)
+        elev_factor   = 1.0 + elev_slope * np.maximum(0.0, elev_m - elev_base_m)
+        road_factor   = 1.0 + road_penalty_slope  * np.maximum(0.0, dist_road  - road_ref_dist_m)
+        water_factor  = 1.0 + water_penalty_slope * np.maximum(0.0, dist_water - water_ref_dist_m)
 
         rng   = np.random.default_rng(0)
         noise = np.clip(1.0 + rng.normal(0.0, noise_sigma, (N, N)), 0.5, 2.5)
 
         cost_grid = np.clip(
-            base_cost * elev_factor * road_factor * water_factor * noise,
+            base_cost * access_factor * elev_factor * road_factor * water_factor * noise,
             0.0, None)
 
         # write directly into the grid cost array
@@ -3766,13 +3780,16 @@ class Annotator(tk.Tk):
             factor_lines.append("  \u2717 water dist  (no hydrology layer path set \u2014 load hydrology to include)")
 
         if n_updated:
-            mean_c = float(cost_grid[ra_mask].mean())
+            mean_c  = float(cost_grid[ra_mask].mean())
+            total_c = float(cost_grid[ra_mask].sum())
             messagebox.showinfo(
                 "Model costs applied",
                 f"{n_updated} CLASS_RA cell(s) updated.\n"
-                f"cell_size={cell_size_m:g} m\n\n"
+                f"Cell side = {cell_size_m:,.2f} m  "
+                f"(cell area = {cell_size_m**2/1e4:,.1f} ha)\n\n"
                 f"Cost factors:\n" + "\n".join(factor_lines) + "\n\n"
-                f"Mean cost: ${mean_c:,.0f}")
+                f"Avg cost / cell : ${mean_c:,.0f}\n"
+                f"Total cost      : ${total_c:,.0f}")
         else:
             messagebox.showinfo("Model costs", "No CLASS_RA cells found.")
 
@@ -3828,7 +3845,35 @@ class Annotator(tk.Tk):
                     f"{self._source_label}  —  {self._N}×{self._N} grid")
             self._grid = g
             self._refresh()
-            messagebox.showinfo("Loaded", f"Session loaded from:\n{path}\nGrid: {g.N}×{g.N}")
+
+            # Build stats summary for the popup
+            import numpy as np
+            labels = g.labels
+            costs  = g.costs
+            total  = labels.size
+            n_hab  = int((labels == CLASS_HAB).sum())
+            n_ra   = int((labels == CLASS_RA ).sum())
+            n_nr   = int((labels == CLASS_NR ).sum())
+            ra_mask     = labels == CLASS_RA
+            total_cost  = float(costs[ra_mask].sum()) if n_ra > 0 else 0.0
+            avg_cost    = total_cost / n_ra            if n_ra > 0 else 0.0
+            n_annotated = n_hab + n_ra + n_nr
+            coverage    = n_annotated / total * 100    if total > 0 else 0.0
+
+            stats = (
+                f"Grid: {g.N}×{g.N}  ({total:,} cells)\n"
+                f"\n"
+                f"Habitat       : {n_hab:>6,}  ({n_hab/total*100:5.1f}%)\n"
+                f"Restorable    : {n_ra:>6,}  ({n_ra/total*100:5.1f}%)\n"
+                f"Non-restorable: {n_nr:>6,}  ({n_nr/total*100:5.1f}%)\n"
+                f"Coverage      : {coverage:.1f}%  ({n_annotated:,} / {total:,} annotated)\n"
+                f"\n"
+                f"Total cost    : {total_cost:>15,.0f}\n"
+                f"Avg cost/cell : {avg_cost:>15,.1f}\n"
+                f"\n"
+                f"{path}"
+            )
+            messagebox.showinfo("Session loaded", stats)
         except Exception as exc:
             messagebox.showerror("Load error", str(exc))
  
