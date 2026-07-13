@@ -44,8 +44,8 @@ Satellite image / GeoPackage
 ## Installation
 
 ```bash
-git clone https://github.com/yourorg/foremost
-cd foremost
+git clone https://github.com/laureberti/FOREMOST
+cd FOREMOST
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
@@ -324,6 +324,16 @@ foremost/
 ├── outputs/                # generated figures and arrays
 └── pyproject.toml
 ```
+
+## Citing this work
+
+If you use FOREMOST in your research, please cite:
+
+> Berti-Equille, L., Saraiva-Maia, J. J., Guérin, J., Cordeiro Estrela, P., Almeida, N., Dutra, M., Romano, V., & Raimundo, R. L. G. (2026).
+> **Forest Restoration Scenarios of Brazil's Atlantic Forest with Constrained Multi-Objective Optimisation.**
+> *Environmental Modelling & Software*. <https://doi.org/10.5281/zenodo.20921038>
+
+Archived code release (Zenodo): <https://doi.org/10.5281/zenodo.20921038>
 
 ## Reference
 

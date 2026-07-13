@@ -111,3 +111,17 @@ ENV/
 
 # appveyor
 .appveyor.yml
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Large video files
+*.mov
+*.mp4
+
+# Generated MkDocs site (committed manually via CI if needed)
+# site/ is currently tracked — leave as-is
