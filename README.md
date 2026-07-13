@@ -337,6 +337,3 @@ In the meantime, please cite the archived code release:
 
 Archived code (Zenodo): <https://doi.org/10.5281/zenodo.20921038>
 
-## Reference
-
-> Justeau-Allaire, D. et al. (2021). *Constrained optimization of landscape indices for conservation planning.* **Journal of Applied Ecology**, 58(4), 744–754. <https://doi.org/10.1111/1365-2664.13803>
