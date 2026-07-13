@@ -37,8 +37,8 @@ layers:
 cost:
   default_cost:   100.0  # $ per cell applied to CLASS_RA cells with no cost
   auto_fill:      true   # fill missing costs automatically on export
-  tree_unit_cost: 15.0   # $ per planted tree
-  tree_spacing_m: 2.5    # metres between trees (2–3 m → 1200–1700 trees/ha)
+  tree_unit_cost: 15.0   # R$ per seedling (Berti-Equille et al. 2026)
+  tree_spacing_m: 2.5    # metres between trees — ~1600 trees/ha (Berti-Equille et al. 2026)
   # Slope-based accessibility filter applied at export time.
   # Cells where the 75th-percentile terrain slope (computed at native DEM
   # resolution, aggregated per planning unit) exceeds max_slope_deg are
