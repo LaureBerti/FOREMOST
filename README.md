@@ -345,7 +345,6 @@ A paper describing FOREMOST is currently under submission to *Environmental Mode
 > **Forest Restoration Scenarios of Brazil's Atlantic Forest with Constrained Multi-Objective Optimisation.**
 > *Environmental Modelling & Software* (under submission).
 
-In the meantime, please cite the archived code release:
+You can also cite the QGIS Plugin archived code release:
 
 Archived code (Zenodo): <https://doi.org/10.5281/zenodo.20921038>
-
