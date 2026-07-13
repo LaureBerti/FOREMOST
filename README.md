@@ -330,7 +330,7 @@ foremost/
 The annotated geospatial input files (GeoPackage `.gpkg` and GeoTIFF `.tif`) for the
 Pernambuco Endemism Centre (PEC) case study are available on Google Drive:
 
-**[Download PEC input data](https://drive.google.com/drive/folders/1VEEAgIa_tUTbVy3nj2Yk2WRZ7CIADRFN?usp=sharing)**
+**[Download PEC input data](https://drive.google.com/drive/folders/1XETeF2TiNJjB_IcaOXwkoR-DkLO3f704?usp=sharing)**
 
 Place the downloaded files under `input/PEC/` before running mode 1 or mode 2.
 The `.npy` annotation arrays (exported by the annotation tool) are included in `outputs/sessions/`.
